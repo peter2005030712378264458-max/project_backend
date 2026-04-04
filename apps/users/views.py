@@ -5,6 +5,10 @@ from rest_framework.permissions import IsAuthenticated
 from rest_framework.generics import CreateAPIView
 from .models import User
 from .serializers import RegisterSerializer
+from rest_framework_simplejwt.views import TokenObtainPairView
+from rest_framework_simplejwt.views import TokenRefreshView
+
+
 
 class RegisterView(CreateAPIView):
     queryset = User.objects.all()
@@ -21,3 +25,40 @@ class MeView(APIView):
             "first_name": request.user.first_name, 
             "registered_at": request.user.date_joined,
         })
+
+class CookieTokenObtainPairView(TokenObtainPairView):
+    def post(self, request, *args, **kwargs):
+        response = super().post(request, *args, **kwargs)
+
+        if response.status_code != 200:
+            return response
+
+        data = response.data
+        access = data.get("access")
+        refresh = data.get("refresh")
+
+        new_response = Response({"access": access})
+
+        new_response.set_cookie(
+            key="refresh_token",
+            value=refresh,
+            httponly=True,
+            secure=False,
+            samesite="Lax",   # для dev лучше Lax
+            path="/"  
+        )
+
+        return new_response
+    
+class CookieTokenRefreshView(TokenRefreshView):
+    def post(self, request, *args, **kwargs):
+        refresh = request.COOKIES.get("refresh_token")
+
+        if not refresh:
+            return Response({"error": "No refresh token"}, status=401)
+
+        request.data["refresh"] = refresh
+
+        response = super().post(request, *args, **kwargs)
+
+        return response
