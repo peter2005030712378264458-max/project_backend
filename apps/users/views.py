@@ -7,6 +7,7 @@ from .models import User
 from .serializers import RegisterSerializer
 from rest_framework_simplejwt.views import TokenObtainPairView
 from rest_framework_simplejwt.views import TokenRefreshView
+from rest_framework_simplejwt.tokens import RefreshToken
 
 
 
@@ -44,7 +45,7 @@ class CookieTokenObtainPairView(TokenObtainPairView):
             value=refresh,
             httponly=True,
             secure=False,
-            samesite="Lax",   # для dev лучше Lax
+            samesite="Lax",   
             path="/"  
         )
 
@@ -57,8 +58,44 @@ class CookieTokenRefreshView(TokenRefreshView):
         if not refresh:
             return Response({"error": "No refresh token"}, status=401)
 
-        request.data["refresh"] = refresh
+        print(refresh)
+        print(request.data["refresh"])
+        
+        data = request.data.copy()   
+        data["refresh"] = refresh
+        
+        serializer = self.get_serializer(data=data)
+        serializer.is_valid(raise_exception=True)
 
-        response = super().post(request, *args, **kwargs)
+class CookieTokenRefreshView(TokenRefreshView):
+    def post(self, request, *args, **kwargs):
+        refresh = request.COOKIES.get("refresh_token")
+
+        if not refresh:
+            return Response({"error": "No refresh token"}, status=401)
+
+        data = request.data.copy()   
+        data["refresh"] = refresh
+
+        serializer = self.get_serializer(data=data)
+        serializer.is_valid(raise_exception=True)
+
+        response = Response(serializer.validated_data, status=200)
+
+        return response
+
+class LogoutView(APIView):
+    def post(self, request):
+        refresh = request.COOKIES.get("refresh_token")
+
+        if refresh:
+            try:
+                token = RefreshToken(refresh)
+                token.blacklist()
+            except Exception:
+                pass
+            
+        response = Response({"message": "Logged out"})
+        response.delete_cookie("refresh_token")
 
         return response
