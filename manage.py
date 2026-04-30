@@ -15,6 +15,7 @@ def main():
     """Run administrative tasks."""
     os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'config.settings')
     try:
+        import django
         from django.core.management import call_command, execute_from_command_line
     except ImportError as exc:
         raise ImportError(
@@ -25,6 +26,7 @@ def main():
 
     if should_run_migrations(sys.argv):
         # Keep the dev database schema in sync before the autoreloader starts.
+        django.setup()
         call_command('migrate', interactive=False)
 
     execute_from_command_line(sys.argv)
