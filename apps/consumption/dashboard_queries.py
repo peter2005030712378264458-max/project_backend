@@ -2,8 +2,24 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from .dashboard_db import dashboard_connection, row_to_dict, rows_to_dicts
+from .dashboard_db import dashboard_connection, dashboard_table, row_to_dict, rows_to_dicts
 
+
+READINGS_TABLE = dashboard_table("READINGS_TABLE")
+SENSOR_TABLE = dashboard_table("SENSOR_TABLE")
+BROAD_QUERY_RAW_LIMIT = 250000
+
+UNAVAILABLE_FILTERS = {
+    "consumer_class": "В новой БД нет справочника классов потребителей.",
+    "building": "В новой БД нет справочника зданий.",
+    "floor": "В новой БД нет справочника этажей.",
+    "location": "В новой БД нет отдельной локации счетчика.",
+}
+
+UNAVAILABLE_RELATIONS = {
+    "breakers": "В новой БД нет справочника автоматов.",
+    "consumers": "В новой БД нет справочника потребителей.",
+}
 
 POWER_METRICS = {
     "active_power_w_avg",
@@ -18,12 +34,70 @@ POWER_METRICS = {
     "meter_temperature_avg",
 }
 
+METRIC_COLUMNS = {
+    "active_power_w_avg": "active_power_w_avg",
+    "phase1_power_w_avg": "phase1_power_w_avg",
+    "phase2_power_w_avg": "phase2_power_w_avg",
+    "phase3_power_w_avg": "phase3_power_w_avg",
+    "reactive_power_var_avg": "reactive_power_var_avg",
+    "apparent_power_va_avg": "apparent_power_va_avg",
+    "current_avg_a": "current_avg_a",
+    "voltage_avg_v": "voltage_avg_v",
+    "frequency_hz_avg": "frequency_hz_avg",
+    "meter_temperature_avg": "meter_temperature_avg",
+}
+
+SUM_TIMESERIES_METRICS = {
+    "active_power_w_avg",
+    "reactive_power_var_avg",
+    "apparent_power_va_avg",
+}
+
+SENSOR_MINUTES_SELECT = """
+    SELECT
+        r.sensor_name AS data_name,
+        COALESCE(r.roomid::text, 'без помещения') AS room,
+        date_trunc('minute', r.ts) AS timestamp_minute,
+        COUNT(*) AS samples,
+        AVG(r.pt) AS active_power_w_avg,
+        MIN(r.pt) AS active_power_w_min,
+        MAX(r.pt) AS active_power_w_max,
+        AVG(r.p1) AS phase1_power_w_avg,
+        AVG(r.p2) AS phase2_power_w_avg,
+        AVG(r.p3) AS phase3_power_w_avg,
+        AVG(r.qt) AS reactive_power_var_avg,
+        AVG(r.st) AS apparent_power_va_avg,
+        AVG((
+            COALESCE(r.i1, 0) + COALESCE(r.i2, 0) + COALESCE(r.i3, 0)
+        ) / NULLIF(
+            (CASE WHEN r.i1 IS NULL THEN 0 ELSE 1 END) +
+            (CASE WHEN r.i2 IS NULL THEN 0 ELSE 1 END) +
+            (CASE WHEN r.i3 IS NULL THEN 0 ELSE 1 END),
+            0
+        )) AS current_avg_a,
+        AVG((
+            COALESCE(r.u1, 0) + COALESCE(r.u2, 0) + COALESCE(r.u3, 0)
+        ) / NULLIF(
+            (CASE WHEN r.u1 IS NULL THEN 0 ELSE 1 END) +
+            (CASE WHEN r.u2 IS NULL THEN 0 ELSE 1 END) +
+            (CASE WHEN r.u3 IS NULL THEN 0 ELSE 1 END),
+            0
+        )) AS voltage_avg_v,
+        AVG(r.frequency) AS frequency_hz_avg,
+        AVG(r.t) AS meter_temperature_avg
+    FROM {readings_source} r
+    {where_sql}
+    GROUP BY r.sensor_name, COALESCE(r.roomid::text, 'без помещения'), date_trunc('minute', r.ts)
+"""
+
 
 @dataclass
 class FilterSet:
     where_sql: str
     params: list[str]
     data_names: list[str] | None
+    default_limited: bool
+    broad_query: bool
 
 
 def _normalize_blank(value: str | None) -> str | None:
@@ -40,182 +114,118 @@ def _split_values(value: str | None) -> list[str]:
 
 
 def _placeholders(values: list[str]) -> str:
-    return ",".join("?" for _ in values)
+    return ",".join("%s" for _ in values)
 
 
-def _matching_data_names(connection, request) -> list[str] | None:
-    direct_data_names = _split_values(request.query_params.get("data_name"))
-    room = _normalize_blank(request.query_params.get("room"))
-    consumer_class = _normalize_blank(request.query_params.get("consumer_class"))
-    building = _normalize_blank(request.query_params.get("building"))
-    floor = _normalize_blank(request.query_params.get("floor"))
-
-    filtered_sets = []
-
-    if direct_data_names:
-        filtered_sets.append(set(direct_data_names))
-
-    if room:
-        rows = connection.execute(
-            """
-            SELECT DISTINCT data_name
-            FROM (
-                SELECT data_name FROM consumers WHERE room = ? AND data_name IS NOT NULL
-                UNION
-                SELECT data_name FROM breakers WHERE room = ? AND data_name IS NOT NULL
-            )
-            """,
-            [room, room],
-        ).fetchall()
-        filtered_sets.append({row["data_name"] for row in rows})
-
-    if consumer_class:
-        rows = connection.execute(
-            """
-            SELECT DISTINCT data_name
-            FROM consumers
-            WHERE data_name IS NOT NULL AND consumer_class = ?
-            """,
-            [consumer_class],
-        ).fetchall()
-        filtered_sets.append({row["data_name"] for row in rows})
-
-    if building or floor:
-        clauses = ["data_name IS NOT NULL"]
-        params = []
-        if building:
-            clauses.append("building = ?")
-            params.append(building)
-        if floor:
-            clauses.append("floor = ?")
-            params.append(floor)
-        rows = connection.execute(
-            f"SELECT DISTINCT data_name FROM breakers WHERE {' AND '.join(clauses)}",
-            params,
-        ).fetchall()
-        filtered_sets.append({row["data_name"] for row in rows})
-
-    if not filtered_sets:
-        return None
-
-    data_names = set.intersection(*filtered_sets) if filtered_sets else set()
-    return sorted(data_names)
-
-
-def _build_power_filters(connection, request) -> FilterSet:
+def _build_power_filters(request, alias: str = "r") -> FilterSet:
     clauses = []
     params: list[str] = []
-    data_names = _matching_data_names(connection, request)
-
-    if data_names is not None:
-        if not data_names:
-            return FilterSet("WHERE 1 = 0", [], data_names)
-        clauses.append(f"data_name IN ({_placeholders(data_names)})")
-        params.extend(data_names)
-
+    data_names = _split_values(request.query_params.get("data_name"))
+    room = _normalize_blank(request.query_params.get("room"))
     date_from = _normalize_blank(request.query_params.get("from"))
     date_to = _normalize_blank(request.query_params.get("to"))
+    default_limited = False
+    broad_query = not data_names and not room
+
+    if data_names:
+        clauses.append(f"{alias}.sensor_name IN ({_placeholders(data_names)})")
+        params.extend(data_names)
+
+    if room:
+        clauses.append(f"{alias}.roomid::text = %s")
+        params.append(room)
 
     if date_from:
-        clauses.append("timestamp_iso >= ?")
+        clauses.append(f"{alias}.ts >= %s")
         params.append(date_from)
+    elif not date_to:
+        clauses.append(
+            f"""
+            {alias}.ts >= (
+                SELECT latest.ts - INTERVAL '1 day'
+                FROM {READINGS_TABLE} latest
+                ORDER BY latest.id DESC
+                LIMIT 1
+            )
+            """
+        )
+        default_limited = True
+
     if date_to:
-        clauses.append("timestamp_iso <= ?")
+        clauses.append(f"{alias}.ts <= %s")
         params.append(date_to)
 
     where_sql = f"WHERE {' AND '.join(clauses)}" if clauses else ""
-    return FilterSet(where_sql, params, data_names)
+    return FilterSet(where_sql, params, data_names or None, default_limited, broad_query)
 
 
-def _alias_power_where(where_sql: str, alias: str) -> str:
-    return (
-        where_sql.replace("data_name", f"{alias}.data_name")
-        .replace("timestamp_iso", f"{alias}.timestamp_iso")
+def _readings_source(filters: FilterSet) -> str:
+    if not filters.broad_query:
+        return READINGS_TABLE
+
+    return f"""
+        (
+            SELECT *
+            FROM {READINGS_TABLE}
+            ORDER BY id DESC
+            LIMIT {BROAD_QUERY_RAW_LIMIT}
+        )
+    """
+
+
+def _sensor_minutes_sql(filters: FilterSet) -> str:
+    return SENSOR_MINUTES_SELECT.format(
+        readings_source=_readings_source(filters),
+        where_sql=filters.where_sql,
     )
+
+
+def _timestamp_iso(expression: str) -> str:
+    return f"to_char(({expression}) AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"')"
 
 
 def get_filters():
     with dashboard_connection() as connection:
         devices = rows_to_dicts(
             connection.execute(
-                """
-                SELECT data_name, dashboard_label AS label, power_location AS location,
-                       power_description AS description, has_breaker_map, has_consumer_map
-                FROM devices
-                WHERE source_type = 'Power'
-                  AND data_name IN (SELECT DISTINCT data_name FROM power_1min)
-                ORDER BY dashboard_label
+                f"""
+                SELECT
+                       sd.sensor_name AS data_name,
+                       sd.sensor_name AS label,
+                       NULL::text AS location,
+                       NULL::text AS description,
+                       FALSE AS has_breaker_map,
+                       FALSE AS has_consumer_map
+                FROM {SENSOR_TABLE} sd
+                ORDER BY sd.sensor_name
                 """
             ).fetchall()
         )
         rooms = rows_to_dicts(
             connection.execute(
-                """
-                SELECT room, COUNT(DISTINCT data_name) AS device_count
-                FROM (
-                    SELECT room, data_name FROM consumers WHERE room IS NOT NULL AND room != ''
-                    UNION ALL
-                    SELECT room, data_name FROM breakers WHERE room IS NOT NULL AND room != ''
-                )
-                WHERE data_name IN (SELECT DISTINCT data_name FROM power_1min)
-                GROUP BY room
+                f"""
+                SELECT COALESCE(sd.roomid::text, 'без помещения') AS room,
+                       COUNT(*) AS device_count
+                FROM {SENSOR_TABLE} sd
+                GROUP BY COALESCE(sd.roomid::text, 'без помещения')
                 ORDER BY room
-                """
-            ).fetchall()
-        )
-        consumer_classes = rows_to_dicts(
-            connection.execute(
-                """
-                SELECT consumer_class, COUNT(*) AS consumer_count
-                FROM consumers
-                WHERE consumer_class IS NOT NULL AND consumer_class != ''
-                  AND data_name IN (SELECT DISTINCT data_name FROM power_1min)
-                GROUP BY consumer_class
-                ORDER BY consumer_class
-                """
-            ).fetchall()
-        )
-        buildings = rows_to_dicts(
-            connection.execute(
-                """
-                SELECT building, COUNT(DISTINCT data_name) AS device_count
-                FROM breakers
-                WHERE building IS NOT NULL AND building != ''
-                  AND data_name IN (SELECT DISTINCT data_name FROM power_1min)
-                GROUP BY building
-                ORDER BY building
-                """
-            ).fetchall()
-        )
-        floors = rows_to_dicts(
-            connection.execute(
-                """
-                SELECT floor, COUNT(DISTINCT data_name) AS device_count
-                FROM breakers
-                WHERE floor IS NOT NULL AND floor != ''
-                  AND data_name IN (SELECT DISTINCT data_name FROM power_1min)
-                GROUP BY floor
-                ORDER BY floor
-                """
-            ).fetchall()
-        )
-        locations = rows_to_dicts(
-            connection.execute(
-                """
-                SELECT power_location AS location, COUNT(*) AS device_count
-                FROM devices
-                WHERE power_location IS NOT NULL AND power_location != ''
-                  AND data_name IN (SELECT DISTINCT data_name FROM power_1min)
-                GROUP BY power_location
-                ORDER BY power_location
                 """
             ).fetchall()
         )
         date_range = row_to_dict(
             connection.execute(
-                """
-                SELECT MIN(timestamp_iso) AS date_from, MAX(timestamp_iso) AS date_to
-                FROM power_1min
+                f"""
+                WITH latest AS (
+                    SELECT r.sensor_name AS data_name,
+                           r.ts AS date_to
+                    FROM {READINGS_TABLE} r
+                    ORDER BY r.id DESC
+                    LIMIT 1
+                )
+                SELECT {_timestamp_iso("date_to - INTERVAL '1 day'")} AS date_from,
+                       {_timestamp_iso('date_to')} AS date_to,
+                       data_name AS default_data_name
+                FROM latest
                 """
             ).fetchone()
         )
@@ -224,30 +234,42 @@ def get_filters():
         "date_range": date_range,
         "devices": devices,
         "rooms": rooms,
-        "consumer_classes": consumer_classes,
-        "buildings": buildings,
-        "floors": floors,
-        "locations": locations,
+        "consumer_classes": [],
+        "buildings": [],
+        "floors": [],
+        "locations": [],
         "metrics": sorted(POWER_METRICS),
+        "default_period": "24h",
+        "default_data_name": date_range.get("default_data_name") if date_range else None,
+        "unavailable_filters": UNAVAILABLE_FILTERS,
+        "unavailable_relations": UNAVAILABLE_RELATIONS,
     }
 
 
 def get_summary(request):
     with dashboard_connection() as connection:
-        filters = _build_power_filters(connection, request)
+        filters = _build_power_filters(request)
+        readings_source = _readings_source(filters)
         row = row_to_dict(
             connection.execute(
                 f"""
                 SELECT COUNT(*) AS points,
-                       COUNT(DISTINCT data_name) AS devices_count,
-                       MIN(timestamp_iso) AS date_from,
-                       MAX(timestamp_iso) AS date_to,
-                       SUM(energy_kwh_est) AS total_energy_kwh,
-                       AVG(active_power_w_avg) / 1000.0 AS avg_power_kw,
-                       MAX(active_power_w_max) / 1000.0 AS max_power_kw,
-                       AVG(voltage_avg_v) AS avg_voltage_v,
-                       AVG(frequency_hz_avg) AS avg_frequency_hz
-                FROM power_1min
+                       COUNT(DISTINCT r.sensor_name) AS devices_count,
+                       {_timestamp_iso('MIN(r.ts)')} AS date_from,
+                       {_timestamp_iso('MAX(r.ts)')} AS date_to,
+                       SUM(r.pt / 60000.0) AS total_energy_kwh,
+                       AVG(r.pt) / 1000.0 AS avg_power_kw,
+                       MAX(r.pt) / 1000.0 AS max_power_kw,
+                       AVG((
+                           COALESCE(r.u1, 0) + COALESCE(r.u2, 0) + COALESCE(r.u3, 0)
+                       ) / NULLIF(
+                           (CASE WHEN r.u1 IS NULL THEN 0 ELSE 1 END) +
+                           (CASE WHEN r.u2 IS NULL THEN 0 ELSE 1 END) +
+                           (CASE WHEN r.u3 IS NULL THEN 0 ELSE 1 END),
+                           0
+                       )) AS avg_voltage_v,
+                       AVG(r.frequency) AS avg_frequency_hz
+                FROM {readings_source} r
                 {filters.where_sql}
                 """,
                 filters.params,
@@ -257,22 +279,28 @@ def get_summary(request):
             connection.execute(
                 f"""
                 WITH latest AS (
-                    SELECT data_name, MAX(timestamp_iso) AS timestamp_iso
-                    FROM power_1min
+                    SELECT DISTINCT ON (r.sensor_name)
+                           r.sensor_name,
+                           r.ts,
+                           r.pt
+                    FROM {readings_source} r
                     {filters.where_sql}
-                    GROUP BY data_name
+                    ORDER BY r.sensor_name, r.ts DESC
                 )
-                SELECT SUM(p.active_power_w_avg) / 1000.0 AS current_power_kw,
-                       MAX(p.timestamp_iso) AS timestamp_iso
-                FROM power_1min p
-                JOIN latest l
-                  ON p.data_name = l.data_name AND p.timestamp_iso = l.timestamp_iso
+                SELECT SUM(pt) / 1000.0 AS current_power_kw,
+                       {_timestamp_iso('MAX(ts)')} AS timestamp_iso
+                FROM latest
                 """,
                 filters.params,
             ).fetchone()
         )
 
-    return {**row, **latest}
+    return {
+        **(row or {}),
+        **(latest or {}),
+        "default_limited": filters.default_limited,
+        "broad_limited": filters.broad_query,
+    }
 
 
 def get_timeseries(request):
@@ -280,18 +308,23 @@ def get_timeseries(request):
     if metric not in POWER_METRICS:
         metric = "active_power_w_avg"
 
+    aggregate = "SUM" if metric in SUM_TIMESERIES_METRICS else "AVG"
+    metric_column = METRIC_COLUMNS[metric]
+
     with dashboard_connection() as connection:
-        filters = _build_power_filters(connection, request)
-        aggregation = "SUM" if metric in {"active_power_w_avg", "reactive_power_var_avg", "apparent_power_va_avg"} else "AVG"
+        filters = _build_power_filters(request)
+        sensor_minutes_sql = _sensor_minutes_sql(filters)
         rows = rows_to_dicts(
             connection.execute(
                 f"""
-                SELECT timestamp_iso AS timestamp,
-                       {aggregation}({metric}) AS value
-                FROM power_1min
-                {filters.where_sql}
-                GROUP BY timestamp_iso
-                ORDER BY timestamp_iso
+                WITH sensor_minutes AS (
+                    {sensor_minutes_sql}
+                )
+                SELECT {_timestamp_iso('timestamp_minute')} AS timestamp,
+                       {aggregate}({metric_column}) AS value
+                FROM sensor_minutes
+                GROUP BY timestamp_minute
+                ORDER BY timestamp_minute
                 LIMIT 20000
                 """,
                 filters.params,
@@ -303,22 +336,22 @@ def get_timeseries(request):
 
 def get_top_devices(request, limit=10):
     with dashboard_connection() as connection:
-        filters = _build_power_filters(connection, request)
+        filters = _build_power_filters(request)
+        readings_source = _readings_source(filters)
         rows = rows_to_dicts(
             connection.execute(
                 f"""
-                SELECT p.data_name,
-                       d.dashboard_label AS label,
-                       d.power_location AS location,
-                       SUM(p.energy_kwh_est) AS energy_kwh,
-                       AVG(p.active_power_w_avg) / 1000.0 AS avg_power_kw,
-                       MAX(p.active_power_w_max) / 1000.0 AS max_power_kw
-                FROM power_1min p
-                LEFT JOIN devices d ON d.data_name = p.data_name
-                {_alias_power_where(filters.where_sql, 'p')}
-                GROUP BY p.data_name, d.dashboard_label, d.power_location
+                SELECT r.sensor_name AS data_name,
+                       r.sensor_name AS label,
+                       NULL::text AS location,
+                       SUM(r.pt / 60000.0) AS energy_kwh,
+                       AVG(r.pt) / 1000.0 AS avg_power_kw,
+                       MAX(r.pt) / 1000.0 AS max_power_kw
+                FROM {readings_source} r
+                {filters.where_sql}
+                GROUP BY r.sensor_name
                 ORDER BY energy_kwh DESC
-                LIMIT ?
+                LIMIT %s
                 """,
                 [*filters.params, limit],
             ).fetchall()
@@ -330,7 +363,22 @@ def get_device_detail(request, data_name):
     with dashboard_connection() as connection:
         device = row_to_dict(
             connection.execute(
-                "SELECT * FROM devices WHERE data_name = ?",
+                f"""
+                SELECT sd.sensor_name AS data_name,
+                       sd.sensor_name AS dashboard_label,
+                       sd.sensor_name AS device_name,
+                       sd.sensor_name AS power_device_name,
+                       sd.id,
+                       sd.roomid::text AS room,
+                       sd.device_listid,
+                       NULL::text AS power_location,
+                       NULL::text AS power_description,
+                       NULL::text AS feeder_name,
+                       FALSE AS has_breaker_map,
+                       FALSE AS has_consumer_map
+                FROM {SENSOR_TABLE} sd
+                WHERE sd.sensor_name = %s
+                """,
                 [data_name],
             ).fetchone()
         )
@@ -339,64 +387,33 @@ def get_device_detail(request, data_name):
 
         summary_request = _RequestProxy(request, data_name)
         summary = get_summary(summary_request)
-        breakers = rows_to_dicts(
-            connection.execute(
-                """
-                SELECT breaker, room, floor, building, phase1_color, phase2_color, phase3_color
-                FROM breakers
-                WHERE data_name = ?
-                ORDER BY room, breaker
-                LIMIT 200
-                """,
-                [data_name],
-            ).fetchall()
-        )
-        consumers = rows_to_dicts(
-            connection.execute(
-                """
-                SELECT power_consumer, consumer_class, room, phase1_color, phase2_color, phase3_color
-                FROM consumers
-                WHERE data_name = ?
-                ORDER BY consumer_class, room, power_consumer
-                LIMIT 200
-                """,
-                [data_name],
-            ).fetchall()
-        )
+
     return {
         "device": device,
         "summary": summary,
-        "breakers": breakers,
-        "consumers": consumers,
+        "breakers": [],
+        "consumers": [],
+        "unavailable_relations": UNAVAILABLE_RELATIONS,
     }
 
 
 def get_room_loads(request, limit=12):
     with dashboard_connection() as connection:
-        filters = _build_power_filters(connection, request)
+        filters = _build_power_filters(request)
+        readings_source = _readings_source(filters)
         rows = rows_to_dicts(
             connection.execute(
                 f"""
-                WITH room_devices AS (
-                    SELECT DISTINCT room, data_name
-                    FROM consumers
-                    WHERE room IS NOT NULL AND room != ''
-                    UNION
-                    SELECT DISTINCT room, data_name
-                    FROM breakers
-                    WHERE room IS NOT NULL AND room != ''
-                )
-                SELECT rd.room,
-                       COUNT(DISTINCT rd.data_name) AS devices_count,
-                       SUM(p.energy_kwh_est) AS energy_kwh,
-                       AVG(p.active_power_w_avg) / 1000.0 AS avg_power_kw,
-                       MAX(p.active_power_w_max) / 1000.0 AS max_power_kw
-                FROM room_devices rd
-                JOIN power_1min p ON p.data_name = rd.data_name
-                {_alias_power_where(filters.where_sql, 'p')}
-                GROUP BY rd.room
+                SELECT COALESCE(r.roomid::text, 'без помещения') AS room,
+                       COUNT(DISTINCT r.sensor_name) AS devices_count,
+                       SUM(r.pt / 60000.0) AS energy_kwh,
+                       AVG(r.pt) / 1000.0 AS avg_power_kw,
+                       MAX(r.pt) / 1000.0 AS max_power_kw
+                FROM {readings_source} r
+                {filters.where_sql}
+                GROUP BY COALESCE(r.roomid::text, 'без помещения')
                 ORDER BY energy_kwh DESC
-                LIMIT ?
+                LIMIT %s
                 """,
                 [*filters.params, limit],
             ).fetchall()

@@ -10,11 +10,34 @@ For the full list of settings and their values, see
 https://docs.djangoproject.com/en/6.0/ref/settings/
 """
 
+import os
 from pathlib import Path
 from datetime import timedelta
 
 # Build paths inside the project like this: BASE_DIR / 'subdir'.
 BASE_DIR = Path(__file__).resolve().parent.parent
+
+
+def load_env_file(path):
+    if not path.exists():
+        return
+
+    for raw_line in path.read_text(encoding='utf-8').splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith('#') or '=' not in line:
+            continue
+
+        key, value = line.split('=', 1)
+        key = key.strip()
+        value = value.strip().strip('"').strip("'")
+        os.environ.setdefault(key, value)
+
+
+def env(name, default=''):
+    return os.environ.get(name, default)
+
+
+load_env_file(BASE_DIR / '.env')
 
 
 # Quick-start development settings - unsuitable for production
@@ -88,7 +111,17 @@ DATABASES = {
     }
 }
 
-ENERGY_DASHBOARD_DB = BASE_DIR / 'data' / 'energy_dashboard.sqlite'
+DASHBOARD_POSTGRES = {
+    'HOST': env('DASHBOARD_POSTGRES_HOST', '127.0.0.1'),
+    'PORT': int(env('DASHBOARD_POSTGRES_PORT', '15432')),
+    'DB': env('DASHBOARD_POSTGRES_DB', 'paradigm_db'),
+    'USER': env('DASHBOARD_POSTGRES_USER', 'student'),
+    'PASSWORD': env('DASHBOARD_POSTGRES_PASSWORD'),
+    'SCHEMA': env('DASHBOARD_POSTGRES_SCHEMA', 'public'),
+    'SENSOR_TABLE': env('DASHBOARD_SENSOR_TABLE', 'sensor_directory'),
+    'READINGS_TABLE': env('DASHBOARD_READINGS_TABLE', 'electricity_sensor_readings'),
+    'CONNECT_TIMEOUT': int(env('DASHBOARD_POSTGRES_CONNECT_TIMEOUT', '10')),
+}
 
 
 # Password validation
