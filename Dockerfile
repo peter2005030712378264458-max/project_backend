@@ -14,4 +14,4 @@ COPY . .
 
 EXPOSE 5000
 
-CMD ["sh", "-c", "echo \"PostgreSQL: ${POSTGRES_USER}@${POSTGRES_HOST}:${POSTGRES_PORT}/${POSTGRES_DB}\" && python manage.py migrate --noinput && python manage.py runserver 0.0.0.0:5000"]
+CMD ["sh", "-c", "echo \"PostgreSQL: ${POSTGRES_USER}@${POSTGRES_HOST}:${POSTGRES_PORT}/${POSTGRES_DB}\" && python wait_for_db.py && python manage.py migrate --noinput && python manage.py runserver 0.0.0.0:5000"]
