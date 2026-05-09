@@ -82,11 +82,14 @@ WSGI_APPLICATION = 'config.wsgi.application'
 # Database
 # https://docs.djangoproject.com/en/6.0/ref/settings/#databases
 
+RUNNING_IN_DOCKER = os.getenv("RUNNING_IN_DOCKER") == "1" or Path("/.dockerenv").exists()
+DEFAULT_POSTGRES_HOST = "host.docker.internal" if RUNNING_IN_DOCKER else "127.0.0.1"
+
 DATABASES = {
     "default": {
         "ENGINE": "django.db.backends.postgresql",
-        "HOST": os.getenv("POSTGRES_HOST", "127.0.0.1"),
-        "PORT": os.getenv("POSTGRES_PORT", "5432"),
+        "HOST": os.getenv("POSTGRES_HOST", DEFAULT_POSTGRES_HOST),
+        "PORT": os.getenv("POSTGRES_PORT", "15432"),
         "NAME": os.getenv("POSTGRES_DB", "student"),
         "USER": os.getenv("POSTGRES_USER", "student"),
         "PASSWORD": os.getenv("POSTGRES_PASSWORD", "st1211@98w"),
