@@ -1,26 +1,50 @@
-import sqlite3
 from contextlib import contextmanager
 
-from django.conf import settings
+from django.db import connection
+
+
+class DashboardResult:
+    def __init__(self, cursor):
+        self.cursor = cursor
+
+    def _row_to_dict(self, row):
+        if row is None:
+            return None
+        columns = [column[0] for column in self.cursor.description]
+        return dict(zip(columns, row))
+
+    def fetchall(self):
+        try:
+            return [self._row_to_dict(row) for row in self.cursor.fetchall()]
+        finally:
+            self.cursor.close()
+
+    def fetchone(self):
+        try:
+            return self._row_to_dict(self.cursor.fetchone())
+        finally:
+            self.cursor.close()
+
+
+class DashboardConnection:
+    def execute(self, sql, params=None):
+        cursor = connection.cursor()
+        cursor.execute(sql, params or [])
+        return DashboardResult(cursor)
 
 
 @contextmanager
 def dashboard_connection():
-    db_path = settings.ENERGY_DASHBOARD_DB
-    if not db_path.exists():
-        raise FileNotFoundError(f"Energy dashboard database not found: {db_path}")
-
-    connection = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
-    connection.row_factory = sqlite3.Row
+    dashboard = DashboardConnection()
     try:
-        yield connection
+        yield dashboard
     finally:
-        connection.close()
+        connection.close_if_unusable_or_obsolete()
 
 
 def rows_to_dicts(rows):
-    return [dict(row) for row in rows]
+    return rows
 
 
 def row_to_dict(row):
-    return dict(row) if row is not None else None
+    return row

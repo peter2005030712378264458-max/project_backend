@@ -56,7 +56,7 @@ class CookieTokenRefreshView(TokenRefreshView):
         refresh = request.COOKIES.get("refresh_token")
 
         if not refresh:
-            return Response({"error": "No refresh token"}, status=401)
+            return Response({"error": "No refresh token"}, status=401) # скорей всего удалить 
 
         print(refresh)
         print(request.data["refresh"])
