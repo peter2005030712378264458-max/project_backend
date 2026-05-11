@@ -26,6 +26,11 @@ TIME_BUCKETS = {
     "day": "day",
     "week": "week",
 }
+TIME_BUCKET_INTERVALS = {
+    "hour": "1 hour",
+    "day": "1 day",
+    "week": "1 week",
+}
 
 IDENTIFIER_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)?$")
 LEGACY_POWER_TABLE_ALIASES = {
@@ -308,6 +313,10 @@ def _timeseries_bucket(request) -> str:
     return TIME_BUCKETS.get(granularity, "day")
 
 
+def _timeseries_interval(bucket: str) -> str:
+    return TIME_BUCKET_INTERVALS[bucket]
+
+
 def get_filters():
     source_table = _power_table()
     with dashboard_connection() as connection:
@@ -444,23 +453,56 @@ def get_timeseries(request):
 
     source_table = _power_table()
     with dashboard_connection() as connection:
-        filters = _build_power_filters(connection, request)
         bucket = _timeseries_bucket(request)
+        interval = _timeseries_interval(bucket)
+        data_names = _matching_data_names(connection, request)
         active_power = _raw_active_power("r")
+        join_clauses = [
+            "r.ts >= b.bucket_start",
+            "r.ts < b.bucket_start + %s::interval",
+        ]
+        params: list[str | int | None] = [
+            _normalize_blank(request.query_params.get("from")),
+            settings.ENERGY_DEFAULT_LOOKBACK_HOURS,
+            _normalize_blank(request.query_params.get("to")),
+            bucket,
+            bucket,
+            interval,
+            interval,
+        ]
+
+        if data_names is not None:
+            if not data_names:
+                return {"metric": metric, "granularity": bucket, "points": []}
+            join_clauses.append(f"r.sensor_name::text IN ({_placeholders(data_names)})")
+            params.extend(data_names)
+
         rows = rows_to_dicts(
             connection.execute(
                 f"""
-                SELECT date_trunc(%s, r.ts) AS timestamp,
-                       AVG({active_power}) / 1000.0 AS value,
-                       SUM({active_power} / 60000.0) AS energy_kwh,
-                       COUNT(*) AS points
-                FROM {source_table} r
-                {_alias_raw_power_where(filters.where_sql, 'r')}
-                GROUP BY date_trunc(%s, r.ts)
-                ORDER BY timestamp
-                LIMIT 5000
+                WITH bounds AS (
+                    SELECT
+                        COALESCE(%s::timestamptz, NOW() - (%s * INTERVAL '1 hour')) AS start_ts,
+                        COALESCE(%s::timestamptz, NOW()) AS end_ts
+                ),
+                buckets AS (
+                    SELECT generate_series(
+                        date_trunc(%s, start_ts),
+                        date_trunc(%s, end_ts),
+                        %s::interval
+                    ) AS bucket_start
+                    FROM bounds
+                )
+                SELECT b.bucket_start AS timestamp,
+                       COALESCE(AVG({active_power}) / 1000.0, 0) AS value,
+                       COALESCE(SUM({active_power} / 60000.0), 0) AS energy_kwh,
+                       COUNT(r.id) AS points
+                FROM buckets b
+                LEFT JOIN {source_table} r ON {' AND '.join(join_clauses)}
+                GROUP BY b.bucket_start
+                ORDER BY b.bucket_start
                 """,
-                [bucket, *filters.params, bucket],
+                params,
             ).fetchall()
         )
 
