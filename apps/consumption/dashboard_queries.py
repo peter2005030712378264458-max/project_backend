@@ -21,6 +21,12 @@ POWER_METRICS = {
     "meter_temperature_avg",
 }
 
+TIME_BUCKETS = {
+    "hour": "hour",
+    "day": "day",
+    "week": "week",
+}
+
 IDENTIFIER_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)?$")
 LEGACY_POWER_TABLE_ALIASES = {
     "power_1min": "electricity_sensor_readings",
@@ -297,6 +303,11 @@ def _raw_voltage_avg(alias: str = "r") -> str:
     """
 
 
+def _timeseries_bucket(request) -> str:
+    granularity = request.query_params.get("granularity", "day")
+    return TIME_BUCKETS.get(granularity, "day")
+
+
 def get_filters():
     source_table = _power_table()
     with dashboard_connection() as connection:
@@ -431,27 +442,29 @@ def get_timeseries(request):
     if metric not in POWER_METRICS:
         metric = "active_power_w_avg"
 
-    power_table = _power_view()
+    source_table = _power_table()
     with dashboard_connection() as connection:
         filters = _build_power_filters(connection, request)
-        aggregation = "SUM" if metric in {"active_power_w_avg", "reactive_power_var_avg", "apparent_power_va_avg"} else "AVG"
+        bucket = _timeseries_bucket(request)
+        active_power = _raw_active_power("r")
         rows = rows_to_dicts(
             connection.execute(
                 f"""
-                {_with_metadata()}
-                SELECT timestamp_iso AS timestamp,
-                       {aggregation}({metric}) AS value
-                FROM {power_table}
-                {filters.where_sql}
-                GROUP BY timestamp_iso
-                ORDER BY timestamp_iso
+                SELECT date_trunc(%s, r.ts) AS timestamp,
+                       AVG({active_power}) / 1000.0 AS value,
+                       SUM({active_power} / 60000.0) AS energy_kwh,
+                       COUNT(*) AS points
+                FROM {source_table} r
+                {_alias_raw_power_where(filters.where_sql, 'r')}
+                GROUP BY date_trunc(%s, r.ts)
+                ORDER BY timestamp
                 LIMIT 5000
                 """,
-                filters.params,
+                [bucket, *filters.params, bucket],
             ).fetchall()
         )
 
-    return {"metric": metric, "points": rows}
+    return {"metric": metric, "granularity": bucket, "points": rows}
 
 
 def get_top_devices(request, limit=10):
