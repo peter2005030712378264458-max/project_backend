@@ -65,7 +65,7 @@ def _power_view() -> str:
 def _power_readings_cte() -> str:
     source_table = _power_table()
     return f"""
-        raw_power_readings AS (
+        power_readings AS (
             SELECT
                    r.sensor_name::text AS data_name,
                    r.ts AS timestamp_iso,
@@ -91,32 +91,9 @@ def _power_readings_cte() -> str:
                            0
                    ) AS voltage_avg_v,
                    r.frequency AS frequency_hz_avg,
-                   r.t AS meter_temperature_avg
+                   r.t AS meter_temperature_avg,
+                   COALESCE(r.pt, COALESCE(r.p1, 0) + COALESCE(r.p2, 0) + COALESCE(r.p3, 0)) / 60000.0 AS energy_kwh_est
             FROM {source_table} r
-        ),
-        power_readings AS (
-            SELECT
-                   rp.*,
-                   rp.active_power_w_avg
-                       * LEAST(
-                           GREATEST(
-                               EXTRACT(
-                                   EPOCH FROM (
-                                       COALESCE(
-                                           LEAD(rp.timestamp_iso) OVER (
-                                               PARTITION BY rp.data_name
-                                               ORDER BY rp.timestamp_iso
-                                           ),
-                                           rp.timestamp_iso + INTERVAL '60 seconds'
-                                       ) - rp.timestamp_iso
-                                   )
-                               ),
-                               0
-                           ),
-                           3600
-                       )
-                       / 3600000.0 AS energy_kwh_est
-            FROM raw_power_readings rp
         )
     """
 
@@ -192,8 +169,10 @@ def _metadata_ctes() -> str:
     """
 
 
-def _with_metadata(extra_ctes: str | None = None) -> str:
-    ctes = f"{_power_readings_cte()}, {_metadata_ctes()}"
+def _with_metadata(extra_ctes: str | None = None, include_power_readings: bool = True) -> str:
+    ctes = _metadata_ctes()
+    if include_power_readings:
+        ctes = f"{_power_readings_cte()}, {ctes}"
     if extra_ctes:
         ctes = f"{ctes}, {extra_ctes}"
     return f"WITH {ctes}"
@@ -214,7 +193,7 @@ def _matching_data_names(connection, request) -> list[str] | None:
     if room:
         rows = connection.execute(
             f"""
-            {_with_metadata()}
+            {_with_metadata(include_power_readings=False)}
             SELECT DISTINCT data_name
             FROM (
                 SELECT data_name FROM consumers WHERE room = %s AND data_name IS NOT NULL
@@ -229,7 +208,7 @@ def _matching_data_names(connection, request) -> list[str] | None:
     if consumer_class:
         rows = connection.execute(
             f"""
-            {_with_metadata()}
+            {_with_metadata(include_power_readings=False)}
             SELECT DISTINCT data_name
             FROM consumers
             WHERE data_name IS NOT NULL AND consumer_class = %s
@@ -248,7 +227,7 @@ def _matching_data_names(connection, request) -> list[str] | None:
             clauses.append("floor = %s")
             params.append(floor)
         rows = connection.execute(
-            f"{_with_metadata()} SELECT DISTINCT data_name FROM breakers WHERE {' AND '.join(clauses)}",
+            f"{_with_metadata(include_power_readings=False)} SELECT DISTINCT data_name FROM breakers WHERE {' AND '.join(clauses)}",
             params,
         ).fetchall()
         filtered_sets.append({row["data_name"] for row in rows})
@@ -293,17 +272,16 @@ def _alias_power_where(where_sql: str, alias: str) -> str:
 
 
 def get_filters():
-    power_table = _power_view()
+    source_table = _power_table()
     with dashboard_connection() as connection:
         devices = rows_to_dicts(
             connection.execute(
                 f"""
-                {_with_metadata()}
+                {_with_metadata(include_power_readings=False)}
                 SELECT data_name, dashboard_label AS label, power_location AS location,
                        power_description AS description, has_breaker_map, has_consumer_map
                 FROM devices
                 WHERE source_type = 'Power'
-                  AND data_name IN (SELECT DISTINCT data_name FROM {power_table})
                 ORDER BY dashboard_label
                 """
             ).fetchall()
@@ -311,14 +289,13 @@ def get_filters():
         rooms = rows_to_dicts(
             connection.execute(
                 f"""
-                {_with_metadata()}
+                {_with_metadata(include_power_readings=False)}
                 SELECT room, COUNT(DISTINCT data_name) AS device_count
                 FROM (
                     SELECT room, data_name FROM consumers WHERE room IS NOT NULL AND room != ''
                     UNION ALL
                     SELECT room, data_name FROM breakers WHERE room IS NOT NULL AND room != ''
                 ) room_sources
-                WHERE data_name IN (SELECT DISTINCT data_name FROM {power_table})
                 GROUP BY room
                 ORDER BY room
                 """
@@ -327,11 +304,10 @@ def get_filters():
         consumer_classes = rows_to_dicts(
             connection.execute(
                 f"""
-                {_with_metadata()}
+                {_with_metadata(include_power_readings=False)}
                 SELECT consumer_class, COUNT(*) AS consumer_count
                 FROM consumers
                 WHERE consumer_class IS NOT NULL AND consumer_class != ''
-                  AND data_name IN (SELECT DISTINCT data_name FROM {power_table})
                 GROUP BY consumer_class
                 ORDER BY consumer_class
                 """
@@ -340,11 +316,10 @@ def get_filters():
         buildings = rows_to_dicts(
             connection.execute(
                 f"""
-                {_with_metadata()}
+                {_with_metadata(include_power_readings=False)}
                 SELECT building, COUNT(DISTINCT data_name) AS device_count
                 FROM breakers
                 WHERE building IS NOT NULL AND building != ''
-                  AND data_name IN (SELECT DISTINCT data_name FROM {power_table})
                 GROUP BY building
                 ORDER BY building
                 """
@@ -353,11 +328,10 @@ def get_filters():
         floors = rows_to_dicts(
             connection.execute(
                 f"""
-                {_with_metadata()}
+                {_with_metadata(include_power_readings=False)}
                 SELECT floor, COUNT(DISTINCT data_name) AS device_count
                 FROM breakers
                 WHERE floor IS NOT NULL AND floor != ''
-                  AND data_name IN (SELECT DISTINCT data_name FROM {power_table})
                 GROUP BY floor
                 ORDER BY floor
                 """
@@ -366,11 +340,10 @@ def get_filters():
         locations = rows_to_dicts(
             connection.execute(
                 f"""
-                {_with_metadata()}
+                {_with_metadata(include_power_readings=False)}
                 SELECT power_location AS location, COUNT(*) AS device_count
                 FROM devices
                 WHERE power_location IS NOT NULL AND power_location != ''
-                  AND data_name IN (SELECT DISTINCT data_name FROM {power_table})
                 GROUP BY power_location
                 ORDER BY power_location
                 """
@@ -379,9 +352,8 @@ def get_filters():
         date_range = row_to_dict(
             connection.execute(
                 f"""
-                {_with_metadata()}
-                SELECT MIN(timestamp_iso) AS date_from, MAX(timestamp_iso) AS date_to
-                FROM {power_table}
+                SELECT MIN(ts) AS date_from, MAX(ts) AS date_to
+                FROM {source_table}
                 """
             ).fetchone()
         )
@@ -504,7 +476,7 @@ def get_device_detail(request, data_name):
     with dashboard_connection() as connection:
         device = row_to_dict(
             connection.execute(
-                f"{_with_metadata()} SELECT * FROM devices WHERE data_name = %s",
+                f"{_with_metadata(include_power_readings=False)} SELECT * FROM devices WHERE data_name = %s",
                 [data_name],
             ).fetchone()
         )
@@ -516,7 +488,7 @@ def get_device_detail(request, data_name):
         breakers = rows_to_dicts(
             connection.execute(
                 f"""
-                {_with_metadata()}
+                {_with_metadata(include_power_readings=False)}
                 SELECT breaker, room, floor, building, phase1_color, phase2_color, phase3_color
                 FROM breakers
                 WHERE data_name = %s
@@ -529,7 +501,7 @@ def get_device_detail(request, data_name):
         consumers = rows_to_dicts(
             connection.execute(
                 f"""
-                {_with_metadata()}
+                {_with_metadata(include_power_readings=False)}
                 SELECT power_consumer, consumer_class, room, phase1_color, phase2_color, phase3_color
                 FROM consumers
                 WHERE data_name = %s
