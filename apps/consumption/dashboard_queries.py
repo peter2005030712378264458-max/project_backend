@@ -445,7 +445,7 @@ def get_timeseries(request):
                 {filters.where_sql}
                 GROUP BY timestamp_iso
                 ORDER BY timestamp_iso
-                LIMIT 20000
+                LIMIT 5000
                 """,
                 filters.params,
             ).fetchall()
