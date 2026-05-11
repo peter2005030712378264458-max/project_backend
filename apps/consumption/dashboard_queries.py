@@ -22,6 +22,9 @@ POWER_METRICS = {
 }
 
 IDENTIFIER_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)?$")
+LEGACY_POWER_TABLE_ALIASES = {
+    "power_1min": "electricity_sensor_readings",
+}
 
 
 @dataclass
@@ -49,7 +52,7 @@ def _placeholders(values: list[str]) -> str:
 
 
 def _power_table() -> str:
-    table_name = settings.ENERGY_POWER_TABLE
+    table_name = LEGACY_POWER_TABLE_ALIASES.get(settings.ENERGY_POWER_TABLE, settings.ENERGY_POWER_TABLE)
     if not IDENTIFIER_RE.match(table_name):
         raise ValueError("ENERGY_POWER_TABLE must be a table name or schema-qualified table name")
     return table_name
