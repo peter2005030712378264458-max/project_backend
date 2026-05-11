@@ -275,6 +275,29 @@ def _alias_power_where(where_sql: str, alias: str) -> str:
     )
 
 
+def _alias_raw_power_where(where_sql: str, alias: str) -> str:
+    return (
+        where_sql.replace("data_name", f"{alias}.sensor_name::text")
+        .replace("timestamp_iso", f"{alias}.ts")
+    )
+
+
+def _raw_active_power(alias: str = "r") -> str:
+    return f"COALESCE({alias}.pt, COALESCE({alias}.p1, 0) + COALESCE({alias}.p2, 0) + COALESCE({alias}.p3, 0))"
+
+
+def _raw_voltage_avg(alias: str = "r") -> str:
+    return f"""
+        (COALESCE({alias}.u1, 0) + COALESCE({alias}.u2, 0) + COALESCE({alias}.u3, 0))
+        / NULLIF(
+            (CASE WHEN {alias}.u1 IS NULL THEN 0 ELSE 1 END)
+          + (CASE WHEN {alias}.u2 IS NULL THEN 0 ELSE 1 END)
+          + (CASE WHEN {alias}.u3 IS NULL THEN 0 ELSE 1 END),
+            0
+        )
+    """
+
+
 def get_filters():
     source_table = _power_table()
     with dashboard_connection() as connection:
@@ -375,50 +398,33 @@ def get_filters():
 
 
 def get_summary(request):
-    power_table = _power_view()
+    source_table = _power_table()
     with dashboard_connection() as connection:
         filters = _build_power_filters(connection, request)
+        active_power = _raw_active_power("r")
+        voltage_avg = _raw_voltage_avg("r")
         row = row_to_dict(
             connection.execute(
                 f"""
-                {_with_metadata()}
                 SELECT COUNT(*) AS points,
-                       COUNT(DISTINCT data_name) AS devices_count,
-                       MIN(timestamp_iso) AS date_from,
-                       MAX(timestamp_iso) AS date_to,
-                       SUM(energy_kwh_est) AS total_energy_kwh,
-                       AVG(active_power_w_avg) / 1000.0 AS avg_power_kw,
-                       MAX(active_power_w_max) / 1000.0 AS max_power_kw,
-                       AVG(voltage_avg_v) AS avg_voltage_v,
-                       AVG(frequency_hz_avg) AS avg_frequency_hz
-                FROM {power_table}
-                {filters.where_sql}
-                """,
-                filters.params,
-            ).fetchone()
-        )
-        latest = row_to_dict(
-            connection.execute(
-                f"""
-                {_with_metadata(f'''
-                    latest AS (
-                        SELECT data_name, MAX(timestamp_iso) AS timestamp_iso
-                        FROM {power_table}
-                        {filters.where_sql}
-                        GROUP BY data_name
-                    )
-                ''')}
-                SELECT SUM(p.active_power_w_avg) / 1000.0 AS current_power_kw,
-                       MAX(p.timestamp_iso) AS timestamp_iso
-                FROM {power_table} p
-                JOIN latest l
-                  ON p.data_name = l.data_name AND p.timestamp_iso = l.timestamp_iso
+                       COUNT(DISTINCT r.sensor_name) AS devices_count,
+                       MIN(r.ts) AS date_from,
+                       MAX(r.ts) AS date_to,
+                       SUM({active_power} / 60000.0) AS total_energy_kwh,
+                       AVG({active_power}) / 1000.0 AS avg_power_kw,
+                       MAX({active_power}) / 1000.0 AS max_power_kw,
+                       AVG({voltage_avg}) AS avg_voltage_v,
+                       AVG(r.frequency) AS avg_frequency_hz,
+                       MAX({active_power}) / 1000.0 AS current_power_kw,
+                       MAX(r.ts) AS timestamp_iso
+                FROM {source_table} r
+                {_alias_raw_power_where(filters.where_sql, "r")}
                 """,
                 filters.params,
             ).fetchone()
         )
 
-    return {**row, **latest}
+    return row
 
 
 def get_timeseries(request):
@@ -450,25 +456,35 @@ def get_timeseries(request):
 
 
 def get_top_devices(request, limit=10):
-    power_table = _power_view()
+    source_table = _power_table()
     with dashboard_connection() as connection:
         filters = _build_power_filters(connection, request)
+        active_power = _raw_active_power("r")
         rows = rows_to_dicts(
             connection.execute(
                 f"""
-                {_with_metadata()}
+                {_with_metadata(f'''
+                    top_power AS (
+                        SELECT r.sensor_name::text AS data_name,
+                               SUM({_raw_active_power("r")} / 60000.0) AS energy_kwh,
+                               AVG({_raw_active_power("r")}) / 1000.0 AS avg_power_kw,
+                               MAX({_raw_active_power("r")}) / 1000.0 AS max_power_kw
+                        FROM {source_table} r
+                        {_alias_raw_power_where(filters.where_sql, "r")}
+                        GROUP BY r.sensor_name
+                        ORDER BY energy_kwh DESC
+                        LIMIT %s
+                    )
+                ''', include_power_readings=False)}
                 SELECT p.data_name,
                        d.dashboard_label AS label,
                        d.power_location AS location,
-                       SUM(p.energy_kwh_est) AS energy_kwh,
-                       AVG(p.active_power_w_avg) / 1000.0 AS avg_power_kw,
-                       MAX(p.active_power_w_max) / 1000.0 AS max_power_kw
-                FROM {power_table} p
+                       p.energy_kwh,
+                       p.avg_power_kw,
+                       p.max_power_kw
+                FROM top_power p
                 LEFT JOIN devices d ON d.data_name = p.data_name
-                {_alias_power_where(filters.where_sql, 'p')}
-                GROUP BY p.data_name, d.dashboard_label, d.power_location
-                ORDER BY energy_kwh DESC
-                LIMIT %s
+                ORDER BY p.energy_kwh DESC
                 """,
                 [*filters.params, limit],
             ).fetchall()
@@ -524,33 +540,24 @@ def get_device_detail(request, data_name):
 
 
 def get_room_loads(request, limit=12):
-    power_table = _power_view()
-    room_devices_cte = """
-        room_devices AS (
-            SELECT DISTINCT room, data_name
-            FROM consumers
-            WHERE room IS NOT NULL AND room != ''
-            UNION
-            SELECT DISTINCT room, data_name
-            FROM breakers
-            WHERE room IS NOT NULL AND room != ''
-        )
-    """
+    source_table = _power_table()
     with dashboard_connection() as connection:
         filters = _build_power_filters(connection, request)
+        active_power = _raw_active_power("r")
         rows = rows_to_dicts(
             connection.execute(
                 f"""
-                {_with_metadata(room_devices_cte)}
-                SELECT rd.room,
-                       COUNT(DISTINCT rd.data_name) AS devices_count,
-                       SUM(p.energy_kwh_est) AS energy_kwh,
-                       AVG(p.active_power_w_avg) / 1000.0 AS avg_power_kw,
-                       MAX(p.active_power_w_max) / 1000.0 AS max_power_kw
-                FROM room_devices rd
-                JOIN {power_table} p ON p.data_name = rd.data_name
-                {_alias_power_where(filters.where_sql, 'p')}
-                GROUP BY rd.room
+                SELECT room.room_number AS room,
+                       COUNT(DISTINCT r.sensor_name) AS devices_count,
+                       SUM({active_power} / 60000.0) AS energy_kwh,
+                       AVG({active_power}) / 1000.0 AS avg_power_kw,
+                       MAX({active_power}) / 1000.0 AS max_power_kw
+                FROM {source_table} r
+                LEFT JOIN sensor_directory sd ON sd.sensor_name = r.sensor_name
+                LEFT JOIN structure.room room ON room.id = sd.roomid
+                {_alias_raw_power_where(filters.where_sql, 'r')}
+                GROUP BY room.room_number
+                HAVING room.room_number IS NOT NULL AND room.room_number != ''
                 ORDER BY energy_kwh DESC
                 LIMIT %s
                 """,
