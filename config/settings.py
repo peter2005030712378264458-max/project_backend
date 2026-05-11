@@ -100,6 +100,7 @@ DATABASES = {
 }
 
 ENERGY_POWER_TABLE = os.getenv("ENERGY_POWER_TABLE", "electricity_sensor_readings")
+ENERGY_DEFAULT_LOOKBACK_HOURS = int(os.getenv("ENERGY_DEFAULT_LOOKBACK_HOURS", "24"))
 
 
 # Password validation
