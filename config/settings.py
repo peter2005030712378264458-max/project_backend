@@ -99,7 +99,7 @@ DATABASES = {
     }
 }
 
-ENERGY_POWER_TABLE = os.getenv("ENERGY_POWER_TABLE", "power_1min")
+ENERGY_POWER_TABLE = os.getenv("ENERGY_POWER_TABLE", "electricity_sensor_readings")
 
 
 # Password validation

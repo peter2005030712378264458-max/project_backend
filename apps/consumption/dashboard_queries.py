@@ -55,103 +55,142 @@ def _power_table() -> str:
     return table_name
 
 
+def _power_view() -> str:
+    return "power_readings"
+
+
+def _power_readings_cte() -> str:
+    source_table = _power_table()
+    return f"""
+        raw_power_readings AS (
+            SELECT
+                   r.sensor_name::text AS data_name,
+                   r.ts AS timestamp_iso,
+                   COALESCE(r.pt, COALESCE(r.p1, 0) + COALESCE(r.p2, 0) + COALESCE(r.p3, 0)) AS active_power_w_avg,
+                   COALESCE(r.pt, COALESCE(r.p1, 0) + COALESCE(r.p2, 0) + COALESCE(r.p3, 0)) AS active_power_w_max,
+                   r.p1 AS phase1_power_w_avg,
+                   r.p2 AS phase2_power_w_avg,
+                   r.p3 AS phase3_power_w_avg,
+                   COALESCE(r.qt, COALESCE(r.q1, 0) + COALESCE(r.q2, 0) + COALESCE(r.q3, 0)) AS reactive_power_var_avg,
+                   COALESCE(r.st, COALESCE(r.s1, 0) + COALESCE(r.s2, 0) + COALESCE(r.s3, 0)) AS apparent_power_va_avg,
+                   (COALESCE(r.i1, 0) + COALESCE(r.i2, 0) + COALESCE(r.i3, 0))
+                       / NULLIF(
+                           (CASE WHEN r.i1 IS NULL THEN 0 ELSE 1 END)
+                         + (CASE WHEN r.i2 IS NULL THEN 0 ELSE 1 END)
+                         + (CASE WHEN r.i3 IS NULL THEN 0 ELSE 1 END),
+                           0
+                       ) AS current_avg_a,
+                   (COALESCE(r.u1, 0) + COALESCE(r.u2, 0) + COALESCE(r.u3, 0))
+                       / NULLIF(
+                           (CASE WHEN r.u1 IS NULL THEN 0 ELSE 1 END)
+                         + (CASE WHEN r.u2 IS NULL THEN 0 ELSE 1 END)
+                         + (CASE WHEN r.u3 IS NULL THEN 0 ELSE 1 END),
+                           0
+                   ) AS voltage_avg_v,
+                   r.frequency AS frequency_hz_avg,
+                   r.t AS meter_temperature_avg
+            FROM {source_table} r
+        ),
+        power_readings AS (
+            SELECT
+                   rp.*,
+                   rp.active_power_w_avg
+                       * LEAST(
+                           GREATEST(
+                               EXTRACT(
+                                   EPOCH FROM (
+                                       COALESCE(
+                                           LEAD(rp.timestamp_iso) OVER (
+                                               PARTITION BY rp.data_name
+                                               ORDER BY rp.timestamp_iso
+                                           ),
+                                           rp.timestamp_iso + INTERVAL '60 seconds'
+                                       ) - rp.timestamp_iso
+                                   )
+                               ),
+                               0
+                           ),
+                           3600
+                       )
+                       / 3600000.0 AS energy_kwh_est
+            FROM raw_power_readings rp
+        )
+    """
+
+
 def _metadata_ctes() -> str:
     return """
-        feeder_rooms AS (
+        sensor_metadata AS (
             SELECT DISTINCT
-                   f.id AS feeder_id,
-                   f.feeder_name AS data_name,
-                   ep.panel_name,
-                   ep.panel_description,
+                   sd.sensor_name::text AS data_name,
+                   sd.id AS sensor_id,
+                   sd.roomid AS sensor_room_id,
                    r.room_number AS room,
                    r.floor_number AS floor,
-                   b.building_name AS building
-            FROM structure.feeder f
-            LEFT JOIN structure.feeder_electrical_panel fep ON fep.feederid = f.id
-            LEFT JOIN structure.electrical_panel ep ON ep.id = fep.electrical_panelid
-            LEFT JOIN structure.room r ON r.id = ep.roomid
+                   b.building_name AS building,
+                   r.room_description,
+                   os.struc_name AS org_structure,
+                   regexp_replace(sd.sensor_name::text, '\\s+Smart Meter$', '') AS feeder_name
+            FROM sensor_directory sd
+            LEFT JOIN structure.room r ON r.id = sd.roomid
             LEFT JOIN structure.building b ON b.id = r.buildingid
-            UNION
-            SELECT DISTINCT
-                   f.id AS feeder_id,
-                   f.feeder_name AS data_name,
-                   NULL::varchar AS panel_name,
-                   NULL::varchar AS panel_description,
-                   r.room_number AS room,
-                   r.floor_number AS floor,
-                   b.building_name AS building
-            FROM structure.feeder f
-            LEFT JOIN structure.room_feeder rf ON rf.feederid = f.id
-            LEFT JOIN structure.room r ON r.id = rf.roomid
-            LEFT JOIN structure.building b ON b.id = r.buildingid
+            LEFT JOIN structure.org_structure os ON os.id = r.org_structureid
         ),
         devices AS (
             SELECT
-                   f.feeder_name AS data_name,
+                   sm.data_name,
                    NULL::text AS raw_file,
                    'Power'::text AS source_type,
-                   f.id::text AS id,
-                   f.feeder_name AS device_name,
-                   f.feeder_name AS power_device_name,
-                   STRING_AGG(DISTINCT NULLIF(fr.room, ''), ', ') AS power_location,
-                   f.feeder_description AS power_description,
-                   f.feeder_name AS feeder_name,
-                   COUNT(DISTINCT psl.id)::integer AS breaker_count,
-                   COUNT(DISTINCT NULLIF(fr.room, ''))::integer AS breaker_room_count,
-                   COUNT(DISTINCT NULLIF(fr.floor, ''))::integer AS breaker_floor_count,
-                   COUNT(DISTINCT NULLIF(fr.building, ''))::integer AS breaker_building_count,
-                   COUNT(DISTINCT fp.id)::integer AS consumer_count,
-                   COUNT(DISTINCT NULLIF(fp.purpose_name, ''))::integer AS consumer_class_count,
-                   COUNT(DISTINCT NULLIF(fr.room, ''))::integer AS consumer_room_count,
+                   sm.sensor_id::text AS id,
+                   sm.data_name AS device_name,
+                   sm.data_name AS power_device_name,
+                   COALESCE(NULLIF(sm.room, ''), sm.sensor_room_id::text) AS power_location,
+                   sm.room_description AS power_description,
+                   sm.feeder_name,
+                   1::integer AS breaker_count,
+                   CASE WHEN sm.room IS NULL OR sm.room = '' THEN 0 ELSE 1 END AS breaker_room_count,
+                   CASE WHEN sm.floor IS NULL OR sm.floor = '' THEN 0 ELSE 1 END AS breaker_floor_count,
+                   CASE WHEN sm.building IS NULL OR sm.building = '' THEN 0 ELSE 1 END AS breaker_building_count,
+                   CASE WHEN sm.org_structure IS NULL OR sm.org_structure = '' THEN 0 ELSE 1 END AS consumer_count,
+                   CASE WHEN sm.org_structure IS NULL OR sm.org_structure = '' THEN 0 ELSE 1 END AS consumer_class_count,
+                   CASE WHEN sm.room IS NULL OR sm.room = '' THEN 0 ELSE 1 END AS consumer_room_count,
                    1::integer AS has_power_metadata,
-                   CASE WHEN COUNT(DISTINCT fr.panel_name) > 0 THEN 1 ELSE 0 END AS has_breaker_map,
-                   CASE WHEN COUNT(DISTINCT fp.id) > 0 THEN 1 ELSE 0 END AS has_consumer_map,
-                   COALESCE(NULLIF(f.feeder_description, ''), f.feeder_name) AS dashboard_label
-            FROM structure.feeder f
-            LEFT JOIN feeder_rooms fr ON fr.feeder_id = f.id
-            LEFT JOIN structure.feeder_electrical_panel fep ON fep.feederid = f.id
-            LEFT JOIN structure.power_supply_lines psl ON psl.electrical_panelid = fep.electrical_panelid
-            LEFT JOIN structure.feeder_purpose fp ON fp.id = psl.feeder_purposeid
-            GROUP BY f.id, f.feeder_name, f.feeder_description
+                   1::integer AS has_breaker_map,
+                   CASE WHEN sm.org_structure IS NULL OR sm.org_structure = '' THEN 0 ELSE 1 END AS has_consumer_map,
+                   sm.data_name AS dashboard_label
+            FROM sensor_metadata sm
         ),
         breakers AS (
             SELECT DISTINCT
-                   f.feeder_name AS feeder,
-                   COALESCE(psl.id::text, fr.panel_name) AS breaker,
-                   fr.room,
-                   fr.floor,
-                   fr.building,
+                   sm.feeder_name AS feeder,
+                   sm.feeder_name AS breaker,
+                   sm.room,
+                   sm.floor,
+                   sm.building,
                    NULL::text AS phase1_color,
                    NULL::text AS phase2_color,
                    NULL::text AS phase3_color,
-                   f.feeder_name AS feeder_name,
-                   f.feeder_name AS data_name
-            FROM structure.feeder f
-            LEFT JOIN feeder_rooms fr ON fr.feeder_id = f.id
-            LEFT JOIN structure.feeder_electrical_panel fep ON fep.feederid = f.id
-            LEFT JOIN structure.power_supply_lines psl ON psl.electrical_panelid = fep.electrical_panelid
+                   sm.feeder_name,
+                   sm.data_name
+            FROM sensor_metadata sm
         ),
         consumers AS (
             SELECT DISTINCT
-                   f.feeder_name AS feeder_code,
-                   COALESCE(fp.purpose_name, fp.purpose_description) AS power_consumer,
-                   fp.purpose_name AS consumer_class,
-                   fr.room,
+                   sm.feeder_name AS feeder_code,
+                   COALESCE(NULLIF(sm.room_description, ''), NULLIF(sm.org_structure, ''), sm.room) AS power_consumer,
+                   sm.org_structure AS consumer_class,
+                   sm.room,
                    NULL::text AS phase1_color,
                    NULL::text AS phase2_color,
                    NULL::text AS phase3_color,
-                   f.feeder_name AS data_name
-            FROM structure.feeder f
-            LEFT JOIN feeder_rooms fr ON fr.feeder_id = f.id
-            LEFT JOIN structure.feeder_electrical_panel fep ON fep.feederid = f.id
-            LEFT JOIN structure.power_supply_lines psl ON psl.electrical_panelid = fep.electrical_panelid
-            LEFT JOIN structure.feeder_purpose fp ON fp.id = psl.feeder_purposeid
+                   sm.data_name
+            FROM sensor_metadata sm
         )
     """
 
 
 def _with_metadata(extra_ctes: str | None = None) -> str:
-    ctes = _metadata_ctes()
+    ctes = f"{_power_readings_cte()}, {_metadata_ctes()}"
     if extra_ctes:
         ctes = f"{ctes}, {extra_ctes}"
     return f"WITH {ctes}"
@@ -251,7 +290,7 @@ def _alias_power_where(where_sql: str, alias: str) -> str:
 
 
 def get_filters():
-    power_table = _power_table()
+    power_table = _power_view()
     with dashboard_connection() as connection:
         devices = rows_to_dicts(
             connection.execute(
@@ -337,6 +376,7 @@ def get_filters():
         date_range = row_to_dict(
             connection.execute(
                 f"""
+                {_with_metadata()}
                 SELECT MIN(timestamp_iso) AS date_from, MAX(timestamp_iso) AS date_to
                 FROM {power_table}
                 """
@@ -356,12 +396,13 @@ def get_filters():
 
 
 def get_summary(request):
-    power_table = _power_table()
+    power_table = _power_view()
     with dashboard_connection() as connection:
         filters = _build_power_filters(connection, request)
         row = row_to_dict(
             connection.execute(
                 f"""
+                {_with_metadata()}
                 SELECT COUNT(*) AS points,
                        COUNT(DISTINCT data_name) AS devices_count,
                        MIN(timestamp_iso) AS date_from,
@@ -380,12 +421,14 @@ def get_summary(request):
         latest = row_to_dict(
             connection.execute(
                 f"""
-                WITH latest AS (
-                    SELECT data_name, MAX(timestamp_iso) AS timestamp_iso
-                    FROM {power_table}
-                    {filters.where_sql}
-                    GROUP BY data_name
-                )
+                {_with_metadata(f'''
+                    latest AS (
+                        SELECT data_name, MAX(timestamp_iso) AS timestamp_iso
+                        FROM {power_table}
+                        {filters.where_sql}
+                        GROUP BY data_name
+                    )
+                ''')}
                 SELECT SUM(p.active_power_w_avg) / 1000.0 AS current_power_kw,
                        MAX(p.timestamp_iso) AS timestamp_iso
                 FROM {power_table} p
@@ -404,13 +447,14 @@ def get_timeseries(request):
     if metric not in POWER_METRICS:
         metric = "active_power_w_avg"
 
-    power_table = _power_table()
+    power_table = _power_view()
     with dashboard_connection() as connection:
         filters = _build_power_filters(connection, request)
         aggregation = "SUM" if metric in {"active_power_w_avg", "reactive_power_var_avg", "apparent_power_va_avg"} else "AVG"
         rows = rows_to_dicts(
             connection.execute(
                 f"""
+                {_with_metadata()}
                 SELECT timestamp_iso AS timestamp,
                        {aggregation}({metric}) AS value
                 FROM {power_table}
@@ -427,7 +471,7 @@ def get_timeseries(request):
 
 
 def get_top_devices(request, limit=10):
-    power_table = _power_table()
+    power_table = _power_view()
     with dashboard_connection() as connection:
         filters = _build_power_filters(connection, request)
         rows = rows_to_dicts(
@@ -501,7 +545,7 @@ def get_device_detail(request, data_name):
 
 
 def get_room_loads(request, limit=12):
-    power_table = _power_table()
+    power_table = _power_view()
     room_devices_cte = """
         room_devices AS (
             SELECT DISTINCT room, data_name
