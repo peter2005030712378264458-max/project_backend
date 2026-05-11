@@ -260,9 +260,8 @@ def _build_power_filters(connection, request) -> FilterSet:
         clauses.append("timestamp_iso <= %s")
         params.append(date_to)
     if not date_from and not date_to and settings.ENERGY_DEFAULT_LOOKBACK_HOURS > 0:
-        clauses.append(
-            f"timestamp_iso >= (SELECT MAX(ts) - INTERVAL '{settings.ENERGY_DEFAULT_LOOKBACK_HOURS} hours' FROM {_power_table()})"
-        )
+        clauses.append("timestamp_iso >= NOW() - (%s * INTERVAL '1 hour')")
+        params.append(str(settings.ENERGY_DEFAULT_LOOKBACK_HOURS))
 
     where_sql = f"WHERE {' AND '.join(clauses)}" if clauses else ""
     return FilterSet(where_sql, params, data_names)
