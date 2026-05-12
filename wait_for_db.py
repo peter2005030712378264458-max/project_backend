@@ -6,9 +6,9 @@ import psycopg
 
 host = os.getenv("POSTGRES_HOST", "127.0.0.1")
 port = os.getenv("POSTGRES_PORT", "15432")
-dbname = os.getenv("POSTGRES_DB", "paradigm_db")
-user = os.getenv("POSTGRES_USER", "student")
-password = os.getenv("POSTGRES_PASSWORD", "")
+dbname = os.getenv("DJANGO_POSTGRES_DB", os.getenv("POSTGRES_DB", "student"))
+user = os.getenv("DJANGO_POSTGRES_USER", os.getenv("POSTGRES_USER", "student"))
+password = os.getenv("DJANGO_POSTGRES_PASSWORD", os.getenv("POSTGRES_PASSWORD", ""))
 timeout = int(os.getenv("POSTGRES_WAIT_TIMEOUT", "60"))
 
 deadline = time.time() + timeout

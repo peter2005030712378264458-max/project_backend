@@ -5,6 +5,9 @@ import sys
 
 
 def should_run_migrations(argv):
+    if os.environ.get("RUN_DJANGO_MIGRATIONS", "0") != "1":
+        return False
+
     command = argv[1] if len(argv) > 1 else ""
     is_runserver = command == "runserver"
     is_reloader_child = os.environ.get("RUN_MAIN") == "true"

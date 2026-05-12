@@ -101,6 +101,10 @@ def _analytics_db_alias() -> str:
     return settings.ENERGY_ANALYTICS_DB_ALIAS
 
 
+def _metadata_db_alias() -> str:
+    return settings.ENERGY_METADATA_DB_ALIAS
+
+
 def _power_view() -> str:
     return "power_readings"
 
@@ -412,7 +416,7 @@ def _timeseries_seconds(bucket: str) -> int:
 
 
 def get_filters():
-    with dashboard_connection() as connection:
+    with dashboard_connection(_metadata_db_alias()) as connection:
         devices = rows_to_dicts(
             connection.execute(
                 f"""
@@ -511,7 +515,7 @@ def get_filters():
 
 
 def get_summary(request):
-    with dashboard_connection() as connection:
+    with dashboard_connection(_metadata_db_alias()) as connection:
         data_names = _matching_data_names(connection, request)
 
     where_sql, params = _aggregate_where_sql(data_names, request)
@@ -557,7 +561,7 @@ def get_timeseries(request):
     if metric not in POWER_METRICS:
         metric = "active_power_w_avg"
 
-    with dashboard_connection() as connection:
+    with dashboard_connection(_metadata_db_alias()) as connection:
         bucket = _timeseries_bucket(request)
         data_names = _matching_data_names(connection, request)
 
@@ -591,7 +595,7 @@ def get_timeseries(request):
 
 
 def get_top_devices(request, limit=10):
-    with dashboard_connection() as connection:
+    with dashboard_connection(_metadata_db_alias()) as connection:
         data_names = _matching_data_names(connection, request)
 
     if data_names is not None and not data_names:
@@ -616,7 +620,7 @@ def get_top_devices(request, limit=10):
             ).fetchall()
         )
 
-    with dashboard_connection() as connection:
+    with dashboard_connection(_metadata_db_alias()) as connection:
         labels = _device_labels(connection, [row["data_name"] for row in power_rows])
 
     rows = []
@@ -633,7 +637,7 @@ def get_top_devices(request, limit=10):
 
 
 def get_device_detail(request, data_name):
-    with dashboard_connection() as connection:
+    with dashboard_connection(_metadata_db_alias()) as connection:
         device = row_to_dict(
             connection.execute(
                 f"{_with_metadata(include_power_readings=False)} SELECT * FROM devices WHERE data_name = %s",
@@ -680,7 +684,7 @@ def get_device_detail(request, data_name):
 
 
 def get_room_loads(request, limit=12):
-    with dashboard_connection() as connection:
+    with dashboard_connection(_metadata_db_alias()) as connection:
         data_names = _matching_data_names(connection, request)
         if data_names is not None and not data_names:
             return []

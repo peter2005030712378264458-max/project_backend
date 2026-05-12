@@ -90,9 +90,21 @@ DATABASES = {
         "ENGINE": "django.db.backends.postgresql",
         "HOST": os.getenv("POSTGRES_HOST", DEFAULT_POSTGRES_HOST),
         "PORT": os.getenv("POSTGRES_PORT", "15432"),
-        "NAME": os.getenv("POSTGRES_DB", "paradigm_db"),
-        "USER": os.getenv("POSTGRES_USER", "student"),
-        "PASSWORD": os.getenv("POSTGRES_PASSWORD", "st1211@98w"),
+        "NAME": os.getenv("DJANGO_POSTGRES_DB", "student"),
+        "USER": os.getenv("DJANGO_POSTGRES_USER", os.getenv("POSTGRES_USER", "student")),
+        "PASSWORD": os.getenv("DJANGO_POSTGRES_PASSWORD", os.getenv("POSTGRES_PASSWORD", "st1211@98w")),
+        "OPTIONS": {
+            "connect_timeout": int(os.getenv("POSTGRES_CONNECT_TIMEOUT", "5")),
+            "options": os.getenv("DJANGO_POSTGRES_OPTIONS", "-c search_path=student_schema,public"),
+        },
+    },
+    "source": {
+        "ENGINE": "django.db.backends.postgresql",
+        "HOST": os.getenv("SOURCE_POSTGRES_HOST", os.getenv("POSTGRES_HOST", DEFAULT_POSTGRES_HOST)),
+        "PORT": os.getenv("SOURCE_POSTGRES_PORT", os.getenv("POSTGRES_PORT", "15432")),
+        "NAME": os.getenv("SOURCE_POSTGRES_DB", os.getenv("POSTGRES_DB", "paradigm_db")),
+        "USER": os.getenv("SOURCE_POSTGRES_USER", os.getenv("POSTGRES_USER", "student")),
+        "PASSWORD": os.getenv("SOURCE_POSTGRES_PASSWORD", os.getenv("POSTGRES_PASSWORD", "st1211@98w")),
         "OPTIONS": {
             "connect_timeout": int(os.getenv("POSTGRES_CONNECT_TIMEOUT", "5")),
         },
@@ -111,6 +123,7 @@ DATABASES = {
 }
 
 ENERGY_POWER_TABLE = os.getenv("ENERGY_POWER_TABLE", "electricity_sensor_readings")
+ENERGY_METADATA_DB_ALIAS = os.getenv("ENERGY_METADATA_DB_ALIAS", "source")
 ENERGY_ANALYTICS_DB_ALIAS = os.getenv("ENERGY_ANALYTICS_DB_ALIAS", "analytics")
 ENERGY_HOURLY_TABLE = os.getenv("ENERGY_HOURLY_TABLE", "student_schema.electricity_sensor_readings_hourly")
 ENERGY_DAILY_TABLE = os.getenv("ENERGY_DAILY_TABLE", "student_schema.electricity_sensor_readings_daily")
