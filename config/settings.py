@@ -96,10 +96,24 @@ DATABASES = {
         "OPTIONS": {
             "connect_timeout": int(os.getenv("POSTGRES_CONNECT_TIMEOUT", "5")),
         },
-    }
+    },
+    "analytics": {
+        "ENGINE": "django.db.backends.postgresql",
+        "HOST": os.getenv("ENERGY_AGG_POSTGRES_HOST", os.getenv("POSTGRES_HOST", DEFAULT_POSTGRES_HOST)),
+        "PORT": os.getenv("ENERGY_AGG_POSTGRES_PORT", os.getenv("POSTGRES_PORT", "15432")),
+        "NAME": os.getenv("ENERGY_AGG_POSTGRES_DB", "student"),
+        "USER": os.getenv("ENERGY_AGG_POSTGRES_USER", os.getenv("POSTGRES_USER", "student")),
+        "PASSWORD": os.getenv("ENERGY_AGG_POSTGRES_PASSWORD", os.getenv("POSTGRES_PASSWORD", "st1211@98w")),
+        "OPTIONS": {
+            "connect_timeout": int(os.getenv("POSTGRES_CONNECT_TIMEOUT", "5")),
+        },
+    },
 }
 
 ENERGY_POWER_TABLE = os.getenv("ENERGY_POWER_TABLE", "electricity_sensor_readings")
+ENERGY_ANALYTICS_DB_ALIAS = os.getenv("ENERGY_ANALYTICS_DB_ALIAS", "analytics")
+ENERGY_HOURLY_TABLE = os.getenv("ENERGY_HOURLY_TABLE", "student_schema.electricity_sensor_readings_hourly")
+ENERGY_DAILY_TABLE = os.getenv("ENERGY_DAILY_TABLE", "student_schema.electricity_sensor_readings_daily")
 ENERGY_DEFAULT_LOOKBACK_HOURS = int(os.getenv("ENERGY_DEFAULT_LOOKBACK_HOURS", "24"))
 
 

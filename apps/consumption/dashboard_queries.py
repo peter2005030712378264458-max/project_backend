@@ -20,6 +20,14 @@ POWER_METRICS = {
     "frequency_hz_avg",
     "meter_temperature_avg",
 }
+DAILY_POWER_METRICS = {
+    "active_power_w_avg",
+    "reactive_power_var_avg",
+    "apparent_power_va_avg",
+    "voltage_avg_v",
+    "frequency_hz_avg",
+    "meter_temperature_avg",
+}
 
 TIME_BUCKETS = {
     "hour": "hour",
@@ -30,6 +38,11 @@ TIME_BUCKET_INTERVALS = {
     "hour": "1 hour",
     "day": "1 day",
     "week": "1 week",
+}
+TIME_BUCKET_SECONDS = {
+    "hour": 3600,
+    "day": 86400,
+    "week": 604800,
 }
 
 IDENTIFIER_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)?$")
@@ -67,6 +80,25 @@ def _power_table() -> str:
     if not IDENTIFIER_RE.match(table_name):
         raise ValueError("ENERGY_POWER_TABLE must be a table name or schema-qualified table name")
     return table_name
+
+
+def _configured_table(setting_name: str) -> str:
+    table_name = getattr(settings, setting_name)
+    if not IDENTIFIER_RE.match(table_name):
+        raise ValueError(f"{setting_name} must be a table name or schema-qualified table name")
+    return table_name
+
+
+def _hourly_table() -> str:
+    return _configured_table("ENERGY_HOURLY_TABLE")
+
+
+def _daily_table() -> str:
+    return _configured_table("ENERGY_DAILY_TABLE")
+
+
+def _analytics_db_alias() -> str:
+    return settings.ENERGY_ANALYTICS_DB_ALIAS
 
 
 def _power_view() -> str:
@@ -278,6 +310,64 @@ def _build_power_filters(connection, request) -> FilterSet:
     return FilterSet(where_sql, params, data_names)
 
 
+def _aggregate_where_sql(data_names: list[str] | None, request, alias: str = "a") -> tuple[str, list[str]]:
+    clauses = []
+    params: list[str] = []
+
+    if data_names is not None:
+        if not data_names:
+            return "WHERE 1 = 0", []
+        clauses.append(f"{alias}.sensor_name::text IN ({_placeholders(data_names)})")
+        params.extend(data_names)
+
+    date_from = _normalize_blank(request.query_params.get("from"))
+    date_to = _normalize_blank(request.query_params.get("to"))
+
+    if date_from:
+        clauses.append(f"{alias}.bucket_start::timestamptz >= %s::timestamptz")
+        params.append(date_from)
+    if date_to:
+        clauses.append(f"{alias}.bucket_start::timestamptz <= %s::timestamptz")
+        params.append(date_to)
+
+    where_sql = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+    return where_sql, params
+
+
+def _weighted_avg_sql(column: str, alias: str = "a") -> str:
+    return (
+        f"SUM({alias}.{column} * {alias}.points_count) "
+        f"/ NULLIF(SUM({alias}.points_count) FILTER (WHERE {alias}.{column} IS NOT NULL), 0)"
+    )
+
+
+def _aggregate_source_for_bucket(bucket: str, metric: str = "active_power_w_avg") -> tuple[str, str, str]:
+    if bucket == "hour":
+        return _hourly_table(), "hour", "a.bucket_start"
+    if bucket == "day" and metric in DAILY_POWER_METRICS:
+        return _daily_table(), "day", "a.bucket_start::timestamptz"
+    if bucket == "week" and metric in DAILY_POWER_METRICS:
+        return _daily_table(), "week", "date_trunc('week', a.bucket_start::timestamptz)"
+    return _hourly_table(), bucket, f"date_trunc('{bucket}', a.bucket_start)"
+
+
+def _device_labels(connection, data_names: list[str]) -> dict[str, dict]:
+    if not data_names:
+        return {}
+    rows = rows_to_dicts(
+        connection.execute(
+            f"""
+            {_with_metadata(include_power_readings=False)}
+            SELECT data_name, dashboard_label AS label, power_location AS location
+            FROM devices
+            WHERE data_name IN ({_placeholders(data_names)})
+            """,
+            data_names,
+        ).fetchall()
+    )
+    return {row["data_name"]: row for row in rows}
+
+
 def _alias_power_where(where_sql: str, alias: str) -> str:
     return (
         where_sql.replace("data_name", f"{alias}.data_name")
@@ -317,8 +407,11 @@ def _timeseries_interval(bucket: str) -> str:
     return TIME_BUCKET_INTERVALS[bucket]
 
 
+def _timeseries_seconds(bucket: str) -> int:
+    return TIME_BUCKET_SECONDS[bucket]
+
+
 def get_filters():
-    source_table = _power_table()
     with dashboard_connection() as connection:
         devices = rows_to_dicts(
             connection.execute(
@@ -395,11 +488,12 @@ def get_filters():
                 """
             ).fetchall()
         )
+    with dashboard_connection(_analytics_db_alias()) as analytics_connection:
         date_range = row_to_dict(
-            connection.execute(
+            analytics_connection.execute(
                 f"""
-                SELECT MIN(ts) AS date_from, MAX(ts) AS date_to
-                FROM {source_table}
+                SELECT MIN(bucket_start) AS date_from, MAX(bucket_start) AS date_to
+                FROM {_hourly_table()}
                 """
             ).fetchone()
         )
@@ -417,29 +511,41 @@ def get_filters():
 
 
 def get_summary(request):
-    source_table = _power_table()
     with dashboard_connection() as connection:
-        filters = _build_power_filters(connection, request)
-        active_power = _raw_active_power("r")
-        voltage_avg = _raw_voltage_avg("r")
+        data_names = _matching_data_names(connection, request)
+
+    where_sql, params = _aggregate_where_sql(data_names, request)
+    with dashboard_connection(_analytics_db_alias()) as connection:
         row = row_to_dict(
             connection.execute(
                 f"""
-                SELECT COUNT(*) AS points,
-                       COUNT(DISTINCT r.sensor_name) AS devices_count,
-                       MIN(r.ts) AS date_from,
-                       MAX(r.ts) AS date_to,
-                       SUM({active_power} / 60000.0) AS total_energy_kwh,
-                       AVG({active_power}) / 1000.0 AS avg_power_kw,
-                       MAX({active_power}) / 1000.0 AS max_power_kw,
-                       AVG({voltage_avg}) AS avg_voltage_v,
-                       AVG(r.frequency) AS avg_frequency_hz,
-                       MAX({active_power}) / 1000.0 AS current_power_kw,
-                       MAX(r.ts) AS timestamp_iso
-                FROM {source_table} r
-                {_alias_raw_power_where(filters.where_sql, "r")}
+                WITH filtered AS (
+                    SELECT *
+                    FROM {_hourly_table()} a
+                    {where_sql}
+                ),
+                latest AS (
+                    SELECT MAX(bucket_start) AS bucket_start
+                    FROM filtered
+                )
+                SELECT COALESCE(SUM(points_count), 0) AS points,
+                       COUNT(DISTINCT sensor_name) AS devices_count,
+                       MIN(bucket_start) AS date_from,
+                       MAX(bucket_start) AS date_to,
+                       SUM(energy_kwh) AS total_energy_kwh,
+                       {_weighted_avg_sql("active_power_w_avg", "filtered")} / 1000.0 AS avg_power_kw,
+                       MAX(active_power_w_max) / 1000.0 AS max_power_kw,
+                       {_weighted_avg_sql("voltage_avg_v", "filtered")} AS avg_voltage_v,
+                       {_weighted_avg_sql("frequency_hz_avg", "filtered")} AS avg_frequency_hz,
+                       (
+                           SELECT {_weighted_avg_sql("active_power_w_avg", "current_rows")} / 1000.0
+                           FROM filtered current_rows
+                           JOIN latest ON latest.bucket_start = current_rows.bucket_start
+                       ) AS current_power_kw,
+                       MAX(bucket_start) AS timestamp_iso
+                FROM filtered
                 """,
-                filters.params,
+                params,
             ).fetchone()
         )
 
@@ -451,97 +557,77 @@ def get_timeseries(request):
     if metric not in POWER_METRICS:
         metric = "active_power_w_avg"
 
-    source_table = _power_table()
     with dashboard_connection() as connection:
         bucket = _timeseries_bucket(request)
-        interval = _timeseries_interval(bucket)
         data_names = _matching_data_names(connection, request)
-        active_power = _raw_active_power("r")
-        join_clauses = [
-            "r.ts >= b.bucket_start",
-            "r.ts < b.bucket_start + %s::interval",
-        ]
-        params: list[str | int | None] = [
-            _normalize_blank(request.query_params.get("from")),
-            settings.ENERGY_DEFAULT_LOOKBACK_HOURS,
-            _normalize_blank(request.query_params.get("to")),
-            bucket,
-            bucket,
-            interval,
-            interval,
-        ]
 
-        if data_names is not None:
-            if not data_names:
-                return {"metric": metric, "granularity": bucket, "points": []}
-            join_clauses.append(f"r.sensor_name::text IN ({_placeholders(data_names)})")
-            params.extend(data_names)
+    if data_names is not None and not data_names:
+        return {"metric": metric, "granularity": bucket, "points": []}
 
+    source_table, granularity, bucket_expr = _aggregate_source_for_bucket(bucket, metric)
+    where_sql, params = _aggregate_where_sql(data_names, request)
+    value_expr = _weighted_avg_sql(metric, "a")
+    if metric.endswith("_power_w_avg"):
+        value_expr = f"({value_expr}) / 1000.0"
+
+    with dashboard_connection(_analytics_db_alias()) as connection:
         rows = rows_to_dicts(
             connection.execute(
                 f"""
-                WITH bounds AS (
-                    SELECT
-                        COALESCE(%s::timestamptz, NOW() - (%s * INTERVAL '1 hour')) AS start_ts,
-                        COALESCE(%s::timestamptz, NOW()) AS end_ts
-                ),
-                buckets AS (
-                    SELECT generate_series(
-                        date_trunc(%s, start_ts),
-                        date_trunc(%s, end_ts),
-                        %s::interval
-                    ) AS bucket_start
-                    FROM bounds
-                )
-                SELECT b.bucket_start AS timestamp,
-                       COALESCE(AVG({active_power}) / 1000.0, 0) AS value,
-                       COALESCE(SUM({active_power} / 60000.0), 0) AS energy_kwh,
-                       COUNT(r.id) AS points
-                FROM buckets b
-                LEFT JOIN {source_table} r ON {' AND '.join(join_clauses)}
-                GROUP BY b.bucket_start
-                ORDER BY b.bucket_start
+                SELECT {bucket_expr} AS timestamp,
+                       {value_expr} AS value,
+                       SUM(a.energy_kwh) AS energy_kwh,
+                       SUM(a.points_count) AS points
+                FROM {source_table} a
+                {where_sql}
+                GROUP BY {bucket_expr}
+                ORDER BY timestamp
                 """,
                 params,
             ).fetchall()
         )
 
-    return {"metric": metric, "granularity": bucket, "points": rows}
+    return {"metric": metric, "granularity": granularity, "points": rows}
 
 
 def get_top_devices(request, limit=10):
-    source_table = _power_table()
     with dashboard_connection() as connection:
-        filters = _build_power_filters(connection, request)
-        active_power = _raw_active_power("r")
-        rows = rows_to_dicts(
+        data_names = _matching_data_names(connection, request)
+
+    if data_names is not None and not data_names:
+        return []
+
+    where_sql, params = _aggregate_where_sql(data_names, request)
+    with dashboard_connection(_analytics_db_alias()) as connection:
+        power_rows = rows_to_dicts(
             connection.execute(
                 f"""
-                {_with_metadata(f'''
-                    top_power AS (
-                        SELECT r.sensor_name::text AS data_name,
-                               SUM({_raw_active_power("r")} / 60000.0) AS energy_kwh,
-                               AVG({_raw_active_power("r")}) / 1000.0 AS avg_power_kw,
-                               MAX({_raw_active_power("r")}) / 1000.0 AS max_power_kw
-                        FROM {source_table} r
-                        {_alias_raw_power_where(filters.where_sql, "r")}
-                        GROUP BY r.sensor_name
-                        ORDER BY energy_kwh DESC
-                        LIMIT %s
-                    )
-                ''', include_power_readings=False)}
-                SELECT p.data_name,
-                       d.dashboard_label AS label,
-                       d.power_location AS location,
-                       p.energy_kwh,
-                       p.avg_power_kw,
-                       p.max_power_kw
-                FROM top_power p
-                LEFT JOIN devices d ON d.data_name = p.data_name
-                ORDER BY p.energy_kwh DESC
+                SELECT a.sensor_name::text AS data_name,
+                       SUM(a.energy_kwh) AS energy_kwh,
+                       {_weighted_avg_sql("active_power_w_avg", "a")} / 1000.0 AS avg_power_kw,
+                       MAX(a.active_power_w_max) / 1000.0 AS max_power_kw
+                FROM {_hourly_table()} a
+                {where_sql}
+                GROUP BY a.sensor_name
+                ORDER BY energy_kwh DESC NULLS LAST
+                LIMIT %s
                 """,
-                [*filters.params, limit],
+                [*params, limit],
             ).fetchall()
+        )
+
+    with dashboard_connection() as connection:
+        labels = _device_labels(connection, [row["data_name"] for row in power_rows])
+
+    rows = []
+    for row in power_rows:
+        device = labels.get(row["data_name"], {})
+        rows.append(
+            {
+                **row,
+                "label": device.get("label") or row["data_name"],
+                "location": device.get("location"),
+            }
         )
     return rows
 
@@ -594,31 +680,99 @@ def get_device_detail(request, data_name):
 
 
 def get_room_loads(request, limit=12):
-    source_table = _power_table()
     with dashboard_connection() as connection:
-        filters = _build_power_filters(connection, request)
-        active_power = _raw_active_power("r")
-        rows = rows_to_dicts(
+        data_names = _matching_data_names(connection, request)
+        if data_names is not None and not data_names:
+            return []
+
+        room_params = []
+        room_filter = ""
+        if data_names is not None:
+            room_filter = f"WHERE data_name IN ({_placeholders(data_names)})"
+            room_params = data_names
+
+        room_rows = rows_to_dicts(
             connection.execute(
                 f"""
-                SELECT room.room_number AS room,
-                       COUNT(DISTINCT r.sensor_name) AS devices_count,
-                       SUM({active_power} / 60000.0) AS energy_kwh,
-                       AVG({active_power}) / 1000.0 AS avg_power_kw,
-                       MAX({active_power}) / 1000.0 AS max_power_kw
-                FROM {source_table} r
-                LEFT JOIN sensor_directory sd ON sd.sensor_name = r.sensor_name
-                LEFT JOIN structure.room room ON room.id = sd.roomid
-                {_alias_raw_power_where(filters.where_sql, 'r')}
-                GROUP BY room.room_number
-                HAVING room.room_number IS NOT NULL AND room.room_number != ''
-                ORDER BY energy_kwh DESC
-                LIMIT %s
+                {_with_metadata(include_power_readings=False)}
+                SELECT data_name, room
+                FROM breakers
+                {room_filter}
                 """,
-                [*filters.params, limit],
+                room_params,
             ).fetchall()
         )
-    return rows
+
+    sensor_rooms = {
+        row["data_name"]: row["room"]
+        for row in room_rows
+        if row.get("data_name") and row.get("room")
+    }
+    if not sensor_rooms:
+        return []
+
+    where_sql, params = _aggregate_where_sql(list(sensor_rooms), request)
+    with dashboard_connection(_analytics_db_alias()) as connection:
+        power_rows = rows_to_dicts(
+            connection.execute(
+                f"""
+                SELECT a.sensor_name::text AS data_name,
+                       SUM(a.points_count) AS points_count,
+                       SUM(a.energy_kwh) AS energy_kwh,
+                       {_weighted_avg_sql("active_power_w_avg", "a")} / 1000.0 AS avg_power_kw,
+                       MAX(a.active_power_w_max) / 1000.0 AS max_power_kw
+                FROM {_hourly_table()} a
+                {where_sql}
+                GROUP BY a.sensor_name
+                """,
+                params,
+            ).fetchall()
+        )
+
+    rooms: dict[str, dict] = {}
+    for row in power_rows:
+        room = sensor_rooms.get(row["data_name"])
+        if not room:
+            continue
+        room_bucket = rooms.setdefault(
+            room,
+            {
+                "room": room,
+                "devices": set(),
+                "points_count": 0,
+                "energy_kwh": 0,
+                "weighted_power_sum": 0,
+                "max_power_kw": None,
+            },
+        )
+        points_count = row.get("points_count") or 0
+        avg_power_kw = row.get("avg_power_kw") or 0
+        energy_kwh = row.get("energy_kwh") or 0
+        room_bucket["devices"].add(row["data_name"])
+        room_bucket["points_count"] += points_count
+        room_bucket["energy_kwh"] += energy_kwh
+        room_bucket["weighted_power_sum"] += avg_power_kw * points_count
+        if row.get("max_power_kw") is not None:
+            room_bucket["max_power_kw"] = (
+                row["max_power_kw"]
+                if room_bucket["max_power_kw"] is None
+                else max(room_bucket["max_power_kw"], row["max_power_kw"])
+            )
+
+    rows = []
+    for room_bucket in rooms.values():
+        points_count = room_bucket["points_count"]
+        rows.append(
+            {
+                "room": room_bucket["room"],
+                "devices_count": len(room_bucket["devices"]),
+                "energy_kwh": room_bucket["energy_kwh"],
+                "avg_power_kw": room_bucket["weighted_power_sum"] / points_count if points_count else None,
+                "max_power_kw": room_bucket["max_power_kw"],
+            }
+        )
+
+    return sorted(rows, key=lambda row: row["energy_kwh"] or 0, reverse=True)[:limit]
 
 
 class _RequestProxy:

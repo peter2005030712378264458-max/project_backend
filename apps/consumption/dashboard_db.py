@@ -1,6 +1,6 @@
 from contextlib import contextmanager
 
-from django.db import connection
+from django.db import connections
 
 
 class DashboardResult:
@@ -27,19 +27,22 @@ class DashboardResult:
 
 
 class DashboardConnection:
+    def __init__(self, alias="default"):
+        self.alias = alias
+
     def execute(self, sql, params=None):
-        cursor = connection.cursor()
+        cursor = connections[self.alias].cursor()
         cursor.execute(sql, params or [])
         return DashboardResult(cursor)
 
 
 @contextmanager
-def dashboard_connection():
-    dashboard = DashboardConnection()
+def dashboard_connection(alias="default"):
+    dashboard = DashboardConnection(alias)
     try:
         yield dashboard
     finally:
-        connection.close_if_unusable_or_obsolete()
+        connections[alias].close_if_unusable_or_obsolete()
 
 
 def rows_to_dicts(rows):
