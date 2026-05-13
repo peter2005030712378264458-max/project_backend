@@ -314,7 +314,12 @@ def _build_power_filters(connection, request) -> FilterSet:
     return FilterSet(where_sql, params, data_names)
 
 
-def _aggregate_where_sql(data_names: list[str] | None, request, alias: str = "a") -> tuple[str, list[str]]:
+def _aggregate_where_sql(
+    data_names: list[str] | None,
+    request,
+    alias: str = "a",
+    date_filter: str = "timestamp",
+) -> tuple[str, list[str]]:
     clauses = []
     params: list[str] = []
 
@@ -328,10 +333,16 @@ def _aggregate_where_sql(data_names: list[str] | None, request, alias: str = "a"
     date_to = _normalize_blank(request.query_params.get("to"))
 
     if date_from:
-        clauses.append(f"{alias}.bucket_start::timestamptz >= %s::timestamptz")
+        if date_filter == "date":
+            clauses.append(f"{alias}.bucket_start::date >= LEFT(%s, 10)::date")
+        else:
+            clauses.append(f"{alias}.bucket_start::timestamptz >= %s::timestamptz")
         params.append(date_from)
     if date_to:
-        clauses.append(f"{alias}.bucket_start::timestamptz <= %s::timestamptz")
+        if date_filter == "date":
+            clauses.append(f"{alias}.bucket_start::date <= LEFT(%s, 10)::date")
+        else:
+            clauses.append(f"{alias}.bucket_start::timestamptz <= %s::timestamptz")
         params.append(date_to)
 
     where_sql = f"WHERE {' AND '.join(clauses)}" if clauses else ""
@@ -569,7 +580,8 @@ def get_timeseries(request):
         return {"metric": metric, "granularity": bucket, "points": []}
 
     source_table, granularity, bucket_expr = _aggregate_source_for_bucket(bucket, metric)
-    where_sql, params = _aggregate_where_sql(data_names, request)
+    date_filter = "date" if granularity in {"day", "week"} and metric in DAILY_POWER_METRICS else "timestamp"
+    where_sql, params = _aggregate_where_sql(data_names, request, date_filter=date_filter)
     value_expr = _weighted_avg_sql(metric, "a")
     if metric.endswith("_power_w_avg"):
         value_expr = f"({value_expr}) / 1000.0"
