@@ -360,6 +360,12 @@ def _summed_metric_sql(column: str, alias: str = "a") -> str:
     return f"SUM({alias}.{column})"
 
 
+def _bucket_energy_sql(granularity: str, alias: str = "a") -> str:
+    if granularity in {"day", "week"}:
+        return f"SUM({alias}.active_power_w_avg * 24.0) / 1000.0"
+    return f"SUM({alias}.active_power_w_avg) / 1000.0"
+
+
 def _aggregate_source_for_bucket(bucket: str, metric: str = "active_power_w_avg") -> tuple[str, str, str]:
     if bucket == "hour":
         return _hourly_table(), "hour", "a.bucket_start"
@@ -543,26 +549,34 @@ def get_summary(request):
                     FROM {_hourly_table()} a
                     {where_sql}
                 ),
+                bucketed AS (
+                    SELECT bucket_start,
+                           SUM(active_power_w_avg) / 1000.0 AS total_power_kw,
+                           SUM(active_power_w_avg) / 1000.0 AS energy_kwh,
+                           SUM(points_count) AS points_count
+                    FROM filtered
+                    GROUP BY bucket_start
+                ),
                 latest AS (
                     SELECT MAX(bucket_start) AS bucket_start
                     FROM filtered
                 )
-                SELECT COALESCE(SUM(points_count), 0) AS points,
-                       COUNT(DISTINCT sensor_name) AS devices_count,
-                       MIN(bucket_start) AS date_from,
-                       MAX(bucket_start) AS date_to,
-                       SUM(energy_kwh) AS total_energy_kwh,
-                       {_weighted_avg_sql("active_power_w_avg", "filtered")} / 1000.0 AS avg_power_kw,
-                       MAX(active_power_w_max) / 1000.0 AS max_power_kw,
-                       {_weighted_avg_sql("voltage_avg_v", "filtered")} AS avg_voltage_v,
-                       {_weighted_avg_sql("frequency_hz_avg", "filtered")} AS avg_frequency_hz,
+                SELECT COALESCE((SELECT SUM(points_count) FROM filtered), 0) AS points,
+                       (SELECT COUNT(DISTINCT sensor_name) FROM filtered) AS devices_count,
+                       MIN(bucketed.bucket_start) AS date_from,
+                       MAX(bucketed.bucket_start) AS date_to,
+                       SUM(bucketed.energy_kwh) AS total_energy_kwh,
+                       AVG(bucketed.total_power_kw) AS avg_power_kw,
+                       MAX(bucketed.total_power_kw) AS max_power_kw,
+                       (SELECT {_weighted_avg_sql("voltage_avg_v", "filtered")} FROM filtered) AS avg_voltage_v,
+                       (SELECT {_weighted_avg_sql("frequency_hz_avg", "filtered")} FROM filtered) AS avg_frequency_hz,
                        (
-                           SELECT {_weighted_avg_sql("active_power_w_avg", "current_rows")} / 1000.0
+                           SELECT SUM(current_rows.active_power_w_avg) / 1000.0
                            FROM filtered current_rows
                            JOIN latest ON latest.bucket_start = current_rows.bucket_start
                        ) AS current_power_kw,
-                       MAX(bucket_start) AS timestamp_iso
-                FROM filtered
+                       MAX(bucketed.bucket_start) AS timestamp_iso
+                FROM bucketed
                 """,
                 params,
             ).fetchone()
@@ -589,6 +603,7 @@ def get_timeseries(request):
     value_expr = _weighted_avg_sql(metric, "a")
     if metric.endswith("_power_w_avg"):
         value_expr = f"{_summed_metric_sql(metric, 'a')} / 1000.0"
+    energy_expr = _bucket_energy_sql(granularity, "a")
 
     with dashboard_connection(_analytics_db_alias()) as connection:
         rows = rows_to_dicts(
@@ -596,7 +611,7 @@ def get_timeseries(request):
                 f"""
                 SELECT {bucket_expr} AS timestamp,
                        {value_expr} AS value,
-                       SUM(a.energy_kwh) AS energy_kwh,
+                       {energy_expr} AS energy_kwh,
                        SUM(a.points_count) AS points
                 FROM {source_table} a
                 {where_sql}
@@ -623,7 +638,7 @@ def get_top_devices(request, limit=10):
             connection.execute(
                 f"""
                 SELECT a.sensor_name::text AS data_name,
-                       SUM(a.energy_kwh) AS energy_kwh,
+                       SUM(a.active_power_w_avg) / 1000.0 AS energy_kwh,
                        {_weighted_avg_sql("active_power_w_avg", "a")} / 1000.0 AS avg_power_kw,
                        MAX(a.active_power_w_max) / 1000.0 AS max_power_kw
                 FROM {_hourly_table()} a
@@ -738,7 +753,7 @@ def get_room_loads(request, limit=12):
                 f"""
                 SELECT a.sensor_name::text AS data_name,
                        SUM(a.points_count) AS points_count,
-                       SUM(a.energy_kwh) AS energy_kwh,
+                       SUM(a.active_power_w_avg) / 1000.0 AS energy_kwh,
                        {_weighted_avg_sql("active_power_w_avg", "a")} / 1000.0 AS avg_power_kw,
                        MAX(a.active_power_w_max) / 1000.0 AS max_power_kw
                 FROM {_hourly_table()} a
