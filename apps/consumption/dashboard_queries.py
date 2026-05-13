@@ -356,13 +356,17 @@ def _weighted_avg_sql(column: str, alias: str = "a") -> str:
     )
 
 
+def _summed_metric_sql(column: str, alias: str = "a") -> str:
+    return f"SUM({alias}.{column})"
+
+
 def _aggregate_source_for_bucket(bucket: str, metric: str = "active_power_w_avg") -> tuple[str, str, str]:
     if bucket == "hour":
         return _hourly_table(), "hour", "a.bucket_start"
     if bucket == "day" and metric in DAILY_POWER_METRICS:
-        return _daily_table(), "day", "a.bucket_start::timestamptz"
+        return _daily_table(), "day", "a.bucket_start::timestamp AT TIME ZONE 'Europe/Moscow'"
     if bucket == "week" and metric in DAILY_POWER_METRICS:
-        return _daily_table(), "week", "date_trunc('week', a.bucket_start::timestamptz)"
+        return _daily_table(), "week", "date_trunc('week', a.bucket_start::timestamp AT TIME ZONE 'Europe/Moscow')"
     return _hourly_table(), bucket, f"date_trunc('{bucket}', a.bucket_start)"
 
 
@@ -584,7 +588,7 @@ def get_timeseries(request):
     where_sql, params = _aggregate_where_sql(data_names, request, date_filter=date_filter)
     value_expr = _weighted_avg_sql(metric, "a")
     if metric.endswith("_power_w_avg"):
-        value_expr = f"({value_expr}) / 1000.0"
+        value_expr = f"{_summed_metric_sql(metric, 'a')} / 1000.0"
 
     with dashboard_connection(_analytics_db_alias()) as connection:
         rows = rows_to_dicts(
