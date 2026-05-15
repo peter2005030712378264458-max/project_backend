@@ -152,16 +152,36 @@ def _metadata_ctes() -> str:
                    sd.sensor_name::text AS data_name,
                    sd.id AS sensor_id,
                    sd.roomid AS sensor_room_id,
-                   r.room_number AS room,
-                   r.floor_number AS floor,
-                   b.building_name AS building,
-                   r.room_description,
-                   os.struc_name AS org_structure,
-                   regexp_replace(sd.sensor_name::text, '\\s+Smart Meter$', '') AS feeder_name
-            FROM sensor_directory sd
-            LEFT JOIN structure.room r ON r.id = sd.roomid
-            LEFT JOIN structure.building b ON b.id = r.buildingid
-            LEFT JOIN structure.org_structure os ON os.id = r.org_structureid
+                   meter_room.room_number AS meter_room,
+                   meter_room.floor_number AS meter_floor,
+                   meter_building.building_name AS meter_building,
+                   meter_room.room_description AS meter_room_description,
+                   regexp_replace(sd.sensor_name::text, '\\s+Smart Meter$', '') AS feeder_name,
+                   f.id AS feeder_id,
+                   f.feeder_description
+            FROM public.sensor_directory sd
+            LEFT JOIN structure.room meter_room ON meter_room.id = sd.roomid
+            LEFT JOIN structure.building meter_building ON meter_building.id = meter_room.buildingid
+            LEFT JOIN structure.feeder f
+                   ON f.feeder_name = regexp_replace(sd.sensor_name::text, '\\s+Smart Meter$', '')
+        ),
+        consumer_links AS (
+            SELECT DISTINCT
+                   sm.data_name,
+                   sm.feeder_id,
+                   sm.feeder_name,
+                   sm.feeder_description,
+                   consumer_room.id AS consumer_room_id,
+                   consumer_room.room_number AS room,
+                   consumer_room.floor_number AS floor,
+                   consumer_building.building_name AS building,
+                   consumer_room.room_description,
+                   os.struc_name AS org_structure
+            FROM sensor_metadata sm
+            LEFT JOIN structure.room_feeder rf ON rf.feederid = sm.feeder_id
+            LEFT JOIN structure.room consumer_room ON consumer_room.id = rf.roomid
+            LEFT JOIN structure.building consumer_building ON consumer_building.id = consumer_room.buildingid
+            LEFT JOIN structure.org_structure os ON os.id = consumer_room.org_structureid
         ),
         devices AS (
             SELECT
@@ -171,47 +191,92 @@ def _metadata_ctes() -> str:
                    sm.sensor_id::text AS id,
                    sm.data_name AS device_name,
                    sm.data_name AS power_device_name,
-                   COALESCE(NULLIF(sm.room, ''), sm.sensor_room_id::text) AS power_location,
-                   sm.room_description AS power_description,
+                   COALESCE(NULLIF(sm.meter_room, ''), sm.sensor_room_id::text) AS power_location,
+                   sm.meter_room_description AS power_description,
                    sm.feeder_name,
-                   1::integer AS breaker_count,
-                   CASE WHEN sm.room IS NULL OR sm.room = '' THEN 0 ELSE 1 END AS breaker_room_count,
-                   CASE WHEN sm.floor IS NULL OR sm.floor = '' THEN 0 ELSE 1 END AS breaker_floor_count,
-                   CASE WHEN sm.building IS NULL OR sm.building = '' THEN 0 ELSE 1 END AS breaker_building_count,
-                   CASE WHEN sm.org_structure IS NULL OR sm.org_structure = '' THEN 0 ELSE 1 END AS consumer_count,
-                   CASE WHEN sm.org_structure IS NULL OR sm.org_structure = '' THEN 0 ELSE 1 END AS consumer_class_count,
-                   CASE WHEN sm.room IS NULL OR sm.room = '' THEN 0 ELSE 1 END AS consumer_room_count,
+                   CASE WHEN sm.feeder_id IS NULL THEN 0 ELSE 1 END AS breaker_count,
+                   (
+                       SELECT COUNT(DISTINCT cl.room)
+                       FROM consumer_links cl
+                       WHERE cl.data_name = sm.data_name
+                         AND cl.room IS NOT NULL
+                         AND cl.room != ''
+                   )::integer AS breaker_room_count,
+                   (
+                       SELECT COUNT(DISTINCT cl.floor)
+                       FROM consumer_links cl
+                       WHERE cl.data_name = sm.data_name
+                         AND cl.floor IS NOT NULL
+                         AND cl.floor != ''
+                   )::integer AS breaker_floor_count,
+                   (
+                       SELECT COUNT(DISTINCT cl.building)
+                       FROM consumer_links cl
+                       WHERE cl.data_name = sm.data_name
+                         AND cl.building IS NOT NULL
+                         AND cl.building != ''
+                   )::integer AS breaker_building_count,
+                   (
+                       SELECT COUNT(DISTINCT COALESCE(NULLIF(cl.room_description, ''), NULLIF(cl.org_structure, ''), cl.room))
+                       FROM consumer_links cl
+                       WHERE cl.data_name = sm.data_name
+                         AND cl.consumer_room_id IS NOT NULL
+                   )::integer AS consumer_count,
+                   (
+                       SELECT COUNT(DISTINCT cl.org_structure)
+                       FROM consumer_links cl
+                       WHERE cl.data_name = sm.data_name
+                         AND cl.org_structure IS NOT NULL
+                         AND cl.org_structure != ''
+                   )::integer AS consumer_class_count,
+                   (
+                       SELECT COUNT(DISTINCT cl.room)
+                       FROM consumer_links cl
+                       WHERE cl.data_name = sm.data_name
+                         AND cl.room IS NOT NULL
+                         AND cl.room != ''
+                   )::integer AS consumer_room_count,
                    1::integer AS has_power_metadata,
-                   1::integer AS has_breaker_map,
-                   CASE WHEN sm.org_structure IS NULL OR sm.org_structure = '' THEN 0 ELSE 1 END AS has_consumer_map,
+                   CASE WHEN sm.feeder_id IS NULL THEN 0 ELSE 1 END AS has_breaker_map,
+                   CASE
+                       WHEN EXISTS (
+                           SELECT 1
+                           FROM consumer_links cl
+                           WHERE cl.data_name = sm.data_name
+                             AND cl.consumer_room_id IS NOT NULL
+                       ) THEN 1
+                       ELSE 0
+                   END AS has_consumer_map,
                    sm.data_name AS dashboard_label
             FROM sensor_metadata sm
         ),
         breakers AS (
             SELECT DISTINCT
                    sm.feeder_name AS feeder,
-                   sm.feeder_name AS breaker,
-                   sm.room,
-                   sm.floor,
-                   sm.building,
+                   COALESCE(sm.feeder_name, sm.data_name) AS breaker,
+                   cl.room,
+                   cl.floor,
+                   cl.building,
                    NULL::text AS phase1_color,
                    NULL::text AS phase2_color,
                    NULL::text AS phase3_color,
                    sm.feeder_name,
                    sm.data_name
             FROM sensor_metadata sm
+            LEFT JOIN consumer_links cl ON cl.data_name = sm.data_name
         ),
         consumers AS (
             SELECT DISTINCT
-                   sm.feeder_name AS feeder_code,
-                   COALESCE(NULLIF(sm.room_description, ''), NULLIF(sm.org_structure, ''), sm.room) AS power_consumer,
-                   sm.org_structure AS consumer_class,
-                   sm.room,
+                   cl.feeder_name AS feeder_code,
+                   COALESCE(NULLIF(cl.room_description, ''), NULLIF(cl.org_structure, ''), cl.room) AS power_consumer,
+                   cl.org_structure AS consumer_class,
+                   cl.room,
                    NULL::text AS phase1_color,
                    NULL::text AS phase2_color,
                    NULL::text AS phase3_color,
-                   sm.data_name
-            FROM sensor_metadata sm
+                   cl.data_name
+            FROM consumer_links cl
+            WHERE cl.consumer_room_id IS NOT NULL
         )
     """
 
@@ -787,15 +852,15 @@ def get_room_loads(request, limit=12):
             ).fetchall()
         )
 
-    sensor_rooms = {
-        row["data_name"]: row["room"]
-        for row in room_rows
-        if row.get("data_name") and row.get("room")
-    }
+    sensor_rooms: dict[str, set[str]] = {}
+    for row in room_rows:
+        if row.get("data_name") and row.get("room"):
+            sensor_rooms.setdefault(row["data_name"], set()).add(row["room"])
+
     if not sensor_rooms:
         return []
 
-    where_sql, params = _aggregate_where_sql(list(sensor_rooms), request)
+    where_sql, params = _aggregate_where_sql(sorted(sensor_rooms), request)
     with dashboard_connection(_analytics_db_alias()) as connection:
         power_rows = rows_to_dicts(
             connection.execute(
@@ -815,33 +880,39 @@ def get_room_loads(request, limit=12):
 
     rooms: dict[str, dict] = {}
     for row in power_rows:
-        room = sensor_rooms.get(row["data_name"])
-        if not room:
+        linked_rooms = sensor_rooms.get(row["data_name"])
+        if not linked_rooms:
             continue
-        room_bucket = rooms.setdefault(
-            room,
-            {
-                "room": room,
-                "devices": set(),
-                "points_count": 0,
-                "energy_kwh": 0,
-                "weighted_power_sum": 0,
-                "max_power_kw": None,
-            },
-        )
-        points_count = row.get("points_count") or 0
-        avg_power_kw = row.get("avg_power_kw") or 0
-        energy_kwh = row.get("energy_kwh") or 0
-        room_bucket["devices"].add(row["data_name"])
-        room_bucket["points_count"] += points_count
-        room_bucket["energy_kwh"] += energy_kwh
-        room_bucket["weighted_power_sum"] += avg_power_kw * points_count
-        if row.get("max_power_kw") is not None:
-            room_bucket["max_power_kw"] = (
-                row["max_power_kw"]
-                if room_bucket["max_power_kw"] is None
-                else max(room_bucket["max_power_kw"], row["max_power_kw"])
+
+        room_count = len(linked_rooms)
+        points_count = float(row.get("points_count") or 0) / room_count
+        avg_power_kw = float(row.get("avg_power_kw") or 0) / room_count
+        energy_kwh = float(row.get("energy_kwh") or 0) / room_count
+        max_power_kw = row.get("max_power_kw")
+        max_power_kw = float(max_power_kw) / room_count if max_power_kw is not None else None
+
+        for room in sorted(linked_rooms):
+            room_bucket = rooms.setdefault(
+                room,
+                {
+                    "room": room,
+                    "devices": set(),
+                    "points_count": 0,
+                    "energy_kwh": 0,
+                    "weighted_power_sum": 0,
+                    "max_power_kw": None,
+                },
             )
+            room_bucket["devices"].add(row["data_name"])
+            room_bucket["points_count"] += points_count
+            room_bucket["energy_kwh"] += energy_kwh
+            room_bucket["weighted_power_sum"] += avg_power_kw * points_count
+            if max_power_kw is not None:
+                room_bucket["max_power_kw"] = (
+                    max_power_kw
+                    if room_bucket["max_power_kw"] is None
+                    else max(room_bucket["max_power_kw"], max_power_kw)
+                )
 
     rows = []
     for room_bucket in rooms.values():
