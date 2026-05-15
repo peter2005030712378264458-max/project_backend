@@ -436,6 +436,36 @@ def _timeseries_seconds(bucket: str) -> int:
     return TIME_BUCKET_SECONDS[bucket]
 
 
+def _timeseries_boundary_expr(granularity: str, date_filter: str) -> str:
+    if date_filter == "date":
+        date_expr = f"LEFT(%s, 10)::date::timestamp AT TIME ZONE 'Europe/Moscow'"
+        if granularity == "week":
+            return f"date_trunc('week', {date_expr})"
+        return date_expr
+
+    return f"date_trunc('{granularity}', %s::timestamptz)"
+
+
+def _timeseries_bounds_sql(request, granularity: str, date_filter: str) -> tuple[str, str, list[str]]:
+    params: list[str] = []
+    date_from = _normalize_blank(request.query_params.get("from"))
+    date_to = _normalize_blank(request.query_params.get("to"))
+
+    if date_from:
+        start_expr = f"COALESCE({_timeseries_boundary_expr(granularity, date_filter)}, MIN(timestamp))"
+        params.append(date_from)
+    else:
+        start_expr = "MIN(timestamp)"
+
+    if date_to:
+        end_expr = f"COALESCE({_timeseries_boundary_expr(granularity, date_filter)}, MAX(timestamp))"
+        params.append(date_to)
+    else:
+        end_expr = "MAX(timestamp)"
+
+    return start_expr, end_expr, params
+
+
 def get_filters():
     with dashboard_connection(_metadata_db_alias()) as connection:
         devices = rows_to_dicts(
@@ -594,9 +624,6 @@ def get_timeseries(request):
         bucket = _timeseries_bucket(request)
         data_names = _matching_data_names(connection, request)
 
-    if data_names is not None and not data_names:
-        return {"metric": metric, "granularity": bucket, "points": []}
-
     source_table, granularity, bucket_expr = _aggregate_source_for_bucket(bucket, metric)
     date_filter = "date" if granularity in {"day", "week"} and metric in DAILY_POWER_METRICS else "timestamp"
     where_sql, params = _aggregate_where_sql(data_names, request, date_filter=date_filter)
@@ -604,21 +631,43 @@ def get_timeseries(request):
     if metric.endswith("_power_w_avg"):
         value_expr = f"{_summed_metric_sql(metric, 'a')} / 1000.0"
     energy_expr = _bucket_energy_sql(granularity, "a")
+    start_expr, end_expr, bounds_params = _timeseries_bounds_sql(request, granularity, date_filter)
+    interval = _timeseries_interval(granularity)
 
     with dashboard_connection(_analytics_db_alias()) as connection:
         rows = rows_to_dicts(
             connection.execute(
                 f"""
-                SELECT {bucket_expr} AS timestamp,
-                       {value_expr} AS value,
-                       {energy_expr} AS energy_kwh,
-                       SUM(a.points_count) AS points
-                FROM {source_table} a
-                {where_sql}
-                GROUP BY {bucket_expr}
-                ORDER BY timestamp
+                WITH bucketed AS (
+                    SELECT {bucket_expr} AS timestamp,
+                           {value_expr} AS value,
+                           {energy_expr} AS energy_kwh,
+                           SUM(a.points_count) AS points
+                    FROM {source_table} a
+                    {where_sql}
+                    GROUP BY {bucket_expr}
+                ),
+                bounds AS (
+                    SELECT {start_expr} AS start_at,
+                           {end_expr} AS end_at
+                    FROM bucketed
+                ),
+                time_buckets AS (
+                    SELECT generate_series(start_at, end_at, INTERVAL '{interval}') AS timestamp
+                    FROM bounds
+                    WHERE start_at IS NOT NULL
+                      AND end_at IS NOT NULL
+                      AND start_at <= end_at
+                )
+                SELECT time_buckets.timestamp,
+                       COALESCE(bucketed.value, 0) AS value,
+                       COALESCE(bucketed.energy_kwh, 0) AS energy_kwh,
+                       COALESCE(bucketed.points, 0) AS points
+                FROM time_buckets
+                LEFT JOIN bucketed ON bucketed.timestamp = time_buckets.timestamp
+                ORDER BY time_buckets.timestamp
                 """,
-                params,
+                [*params, *bounds_params],
             ).fetchall()
         )
 
