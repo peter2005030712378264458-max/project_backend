@@ -18,6 +18,34 @@ from datetime import timedelta
 BASE_DIR = Path(__file__).resolve().parent.parent
 
 
+def _load_env_file(path: Path) -> None:
+    if not path.exists():
+        return
+
+    for raw_line in path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+
+        key, value = line.split("=", 1)
+        key = key.strip()
+        value = value.strip().strip("\"'")
+        if key and key not in os.environ:
+            os.environ[key] = value
+
+
+def _env(name: str, default: str, *fallback_names: str) -> str:
+    for env_name in (name, *fallback_names):
+        value = os.getenv(env_name)
+        if value is not None and value != "":
+            return value
+    return default
+
+
+_load_env_file(BASE_DIR / ".env")
+_load_env_file(BASE_DIR / ".env.local")
+
+
 # Quick-start development settings - unsuitable for production
 # See https://docs.djangoproject.com/en/6.0/howto/deployment/checklist/
 
@@ -84,40 +112,52 @@ WSGI_APPLICATION = 'config.wsgi.application'
 
 RUNNING_IN_DOCKER = os.getenv("RUNNING_IN_DOCKER") == "1" or Path("/.dockerenv").exists()
 DEFAULT_POSTGRES_HOST = "host.docker.internal" if RUNNING_IN_DOCKER else "127.0.0.1"
+DEFAULT_POSTGRES_PORT = "5432" if RUNNING_IN_DOCKER else "15432"
+DEFAULT_POSTGRES_USER = _env("POSTGRES_USER", "student", "DASHBOARD_POSTGRES_USER")
+DEFAULT_POSTGRES_PASSWORD = _env("POSTGRES_PASSWORD", "st1211@98w", "DASHBOARD_POSTGRES_PASSWORD")
+POSTGRES_KEEPALIVE_OPTIONS = {
+    "keepalives": int(os.getenv("POSTGRES_KEEPALIVES", "1")),
+    "keepalives_idle": int(os.getenv("POSTGRES_KEEPALIVES_IDLE", "30")),
+    "keepalives_interval": int(os.getenv("POSTGRES_KEEPALIVES_INTERVAL", "10")),
+    "keepalives_count": int(os.getenv("POSTGRES_KEEPALIVES_COUNT", "5")),
+}
 
 DATABASES = {
     "default": {
         "ENGINE": "django.db.backends.postgresql",
-        "HOST": os.getenv("POSTGRES_HOST", DEFAULT_POSTGRES_HOST),
-        "PORT": os.getenv("POSTGRES_PORT", "15432"),
+        "HOST": _env("POSTGRES_HOST", DEFAULT_POSTGRES_HOST, "DASHBOARD_POSTGRES_HOST"),
+        "PORT": _env("POSTGRES_PORT", DEFAULT_POSTGRES_PORT, "DASHBOARD_POSTGRES_PORT"),
         "NAME": os.getenv("DJANGO_POSTGRES_DB", "student"),
-        "USER": os.getenv("DJANGO_POSTGRES_USER", os.getenv("POSTGRES_USER", "student")),
-        "PASSWORD": os.getenv("DJANGO_POSTGRES_PASSWORD", os.getenv("POSTGRES_PASSWORD", "st1211@98w")),
+        "USER": os.getenv("DJANGO_POSTGRES_USER", DEFAULT_POSTGRES_USER),
+        "PASSWORD": os.getenv("DJANGO_POSTGRES_PASSWORD", DEFAULT_POSTGRES_PASSWORD),
         "OPTIONS": {
             "connect_timeout": int(os.getenv("POSTGRES_CONNECT_TIMEOUT", "5")),
             "options": os.getenv("DJANGO_POSTGRES_OPTIONS", "-c search_path=student_schema,public"),
+            **POSTGRES_KEEPALIVE_OPTIONS,
         },
     },
     "source": {
         "ENGINE": "django.db.backends.postgresql",
-        "HOST": os.getenv("SOURCE_POSTGRES_HOST", os.getenv("POSTGRES_HOST", DEFAULT_POSTGRES_HOST)),
-        "PORT": os.getenv("SOURCE_POSTGRES_PORT", os.getenv("POSTGRES_PORT", "15432")),
-        "NAME": os.getenv("SOURCE_POSTGRES_DB", os.getenv("POSTGRES_DB", "paradigm_db")),
-        "USER": os.getenv("SOURCE_POSTGRES_USER", os.getenv("POSTGRES_USER", "student")),
-        "PASSWORD": os.getenv("SOURCE_POSTGRES_PASSWORD", os.getenv("POSTGRES_PASSWORD", "st1211@98w")),
+        "HOST": _env("SOURCE_POSTGRES_HOST", _env("POSTGRES_HOST", DEFAULT_POSTGRES_HOST, "DASHBOARD_POSTGRES_HOST")),
+        "PORT": _env("SOURCE_POSTGRES_PORT", _env("POSTGRES_PORT", DEFAULT_POSTGRES_PORT, "DASHBOARD_POSTGRES_PORT")),
+        "NAME": _env("SOURCE_POSTGRES_DB", _env("POSTGRES_DB", "paradigm_db"), "DASHBOARD_POSTGRES_DB"),
+        "USER": os.getenv("SOURCE_POSTGRES_USER", DEFAULT_POSTGRES_USER),
+        "PASSWORD": os.getenv("SOURCE_POSTGRES_PASSWORD", DEFAULT_POSTGRES_PASSWORD),
         "OPTIONS": {
             "connect_timeout": int(os.getenv("POSTGRES_CONNECT_TIMEOUT", "5")),
+            **POSTGRES_KEEPALIVE_OPTIONS,
         },
     },
     "analytics": {
         "ENGINE": "django.db.backends.postgresql",
-        "HOST": os.getenv("ENERGY_AGG_POSTGRES_HOST", os.getenv("POSTGRES_HOST", DEFAULT_POSTGRES_HOST)),
-        "PORT": os.getenv("ENERGY_AGG_POSTGRES_PORT", os.getenv("POSTGRES_PORT", "15432")),
+        "HOST": _env("ENERGY_AGG_POSTGRES_HOST", _env("POSTGRES_HOST", DEFAULT_POSTGRES_HOST, "DASHBOARD_POSTGRES_HOST")),
+        "PORT": _env("ENERGY_AGG_POSTGRES_PORT", _env("POSTGRES_PORT", DEFAULT_POSTGRES_PORT, "DASHBOARD_POSTGRES_PORT")),
         "NAME": os.getenv("ENERGY_AGG_POSTGRES_DB", "student"),
-        "USER": os.getenv("ENERGY_AGG_POSTGRES_USER", os.getenv("POSTGRES_USER", "student")),
-        "PASSWORD": os.getenv("ENERGY_AGG_POSTGRES_PASSWORD", os.getenv("POSTGRES_PASSWORD", "st1211@98w")),
+        "USER": os.getenv("ENERGY_AGG_POSTGRES_USER", DEFAULT_POSTGRES_USER),
+        "PASSWORD": os.getenv("ENERGY_AGG_POSTGRES_PASSWORD", DEFAULT_POSTGRES_PASSWORD),
         "OPTIONS": {
             "connect_timeout": int(os.getenv("POSTGRES_CONNECT_TIMEOUT", "5")),
+            **POSTGRES_KEEPALIVE_OPTIONS,
         },
     },
 }
