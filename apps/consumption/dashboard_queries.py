@@ -44,6 +44,7 @@ TIME_BUCKET_SECONDS = {
     "day": 86400,
     "week": 604800,
 }
+ROOM_LOADS_LIMIT = 12
 
 IDENTIFIER_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)?$")
 LEGACY_POWER_TABLE_ALIASES = {
@@ -828,7 +829,43 @@ def get_device_detail(request, data_name):
     }
 
 
-def get_room_loads(request, limit=12):
+def _aggregate_room_load_rows(rows: list[dict], room: str, is_other: bool = False) -> dict:
+    points_count = sum(float(row.get("points_count") or 0) for row in rows)
+    weighted_power_sum = sum(float(row.get("avg_power_kw") or 0) * float(row.get("points_count") or 0) for row in rows)
+    max_power_values = [float(row["max_power_kw"]) for row in rows if row.get("max_power_kw") is not None]
+
+    return {
+        "room": room,
+        "is_unallocated": False,
+        "is_other": is_other,
+        "devices_count": sum(row.get("devices_count") or 0 for row in rows),
+        "points_count": points_count,
+        "energy_kwh": sum(float(row.get("energy_kwh") or 0) for row in rows),
+        "avg_power_kw": weighted_power_sum / points_count if points_count else None,
+        "max_power_kw": max(max_power_values) if max_power_values else None,
+    }
+
+
+def _limit_room_load_rows(rows: list[dict], limit: int) -> list[dict]:
+    if limit <= 0:
+        return []
+    if len(rows) <= limit:
+        return rows
+
+    unallocated_rows = [row for row in rows if row.get("is_unallocated")]
+    room_rows = [row for row in rows if not row.get("is_unallocated")]
+    visible_room_count = max(0, limit - len(unallocated_rows) - 1)
+    visible_rows = room_rows[:visible_room_count]
+    hidden_rows = room_rows[visible_room_count:]
+
+    if hidden_rows:
+        visible_rows.append(_aggregate_room_load_rows(hidden_rows, "Другие помещения", is_other=True))
+
+    visible_rows.extend(unallocated_rows)
+    return visible_rows[:limit]
+
+
+def get_room_loads(request, limit=ROOM_LOADS_LIMIT):
     with dashboard_connection(_metadata_db_alias()) as connection:
         data_names = _matching_data_names(connection, request)
         if data_names is not None and not data_names:
@@ -858,9 +895,9 @@ def get_room_loads(request, limit=12):
             sensor_rooms.setdefault(row["data_name"], set()).add(row["room"])
 
     if not sensor_rooms:
-        return []
+        sensor_rooms = {}
 
-    where_sql, params = _aggregate_where_sql(sorted(sensor_rooms), request)
+    where_sql, params = _aggregate_where_sql(data_names, request)
     with dashboard_connection(_analytics_db_alias()) as connection:
         power_rows = rows_to_dicts(
             connection.execute(
@@ -879,23 +916,23 @@ def get_room_loads(request, limit=12):
         )
 
     rooms: dict[str, dict] = {}
+    unallocated_room = "Не распределено"
     for row in power_rows:
         linked_rooms = sensor_rooms.get(row["data_name"])
-        if not linked_rooms:
-            continue
-
-        room_count = len(linked_rooms)
+        target_rooms = sorted(linked_rooms) if linked_rooms else [unallocated_room]
+        room_count = len(target_rooms)
         points_count = float(row.get("points_count") or 0) / room_count
         avg_power_kw = float(row.get("avg_power_kw") or 0) / room_count
         energy_kwh = float(row.get("energy_kwh") or 0) / room_count
         max_power_kw = row.get("max_power_kw")
         max_power_kw = float(max_power_kw) / room_count if max_power_kw is not None else None
 
-        for room in sorted(linked_rooms):
+        for room in target_rooms:
             room_bucket = rooms.setdefault(
                 room,
                 {
                     "room": room,
+                    "is_unallocated": room == unallocated_room,
                     "devices": set(),
                     "points_count": 0,
                     "energy_kwh": 0,
@@ -920,14 +957,22 @@ def get_room_loads(request, limit=12):
         rows.append(
             {
                 "room": room_bucket["room"],
+                "is_unallocated": room_bucket["is_unallocated"],
+                "is_other": False,
                 "devices_count": len(room_bucket["devices"]),
+                "points_count": points_count,
                 "energy_kwh": room_bucket["energy_kwh"],
                 "avg_power_kw": room_bucket["weighted_power_sum"] / points_count if points_count else None,
                 "max_power_kw": room_bucket["max_power_kw"],
             }
         )
 
-    return sorted(rows, key=lambda row: row["energy_kwh"] or 0, reverse=True)[:limit]
+    rows = sorted(rows, key=lambda row: row["energy_kwh"] or 0, reverse=True)
+
+    if limit is None:
+        return rows
+
+    return _limit_room_load_rows(rows, limit)
 
 
 class _RequestProxy:
