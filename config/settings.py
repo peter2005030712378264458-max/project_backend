@@ -169,6 +169,10 @@ ENERGY_HOURLY_TABLE = os.getenv("ENERGY_HOURLY_TABLE", "student_schema.electrici
 ENERGY_DAILY_TABLE = os.getenv("ENERGY_DAILY_TABLE", "student_schema.electricity_sensor_readings_daily")
 ENERGY_DEFAULT_LOOKBACK_HOURS = int(os.getenv("ENERGY_DEFAULT_LOOKBACK_HOURS", "24"))
 
+ANALYTICS_SERVICE_URL = os.getenv("ANALYTICS_SERVICE_URL", "http://127.0.0.1:8001")
+ANALYTICS_SERVICE_TIMEOUT_SECONDS = float(os.getenv("ANALYTICS_SERVICE_TIMEOUT_SECONDS", "10"))
+ANALYTICS_SERVICE_TOKEN = os.getenv("ANALYTICS_SERVICE_TOKEN", "")
+
 
 # Password validation
 # https://docs.djangoproject.com/en/6.0/ref/settings/#auth-password-validators

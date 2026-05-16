@@ -1,5 +1,6 @@
 from django.urls import path
 
+from .analytics_views import PeriodComparisonView
 from .dashboard_views import (
     DashboardDeviceDetailView,
     DashboardFiltersView,
@@ -11,6 +12,7 @@ from .dashboard_views import (
 
 
 urlpatterns = [
+    path("analytics/period-comparison/", PeriodComparisonView.as_view(), name="analytics-period-comparison"),
     path("dashboard/filters/", DashboardFiltersView.as_view(), name="dashboard-filters"),
     path("dashboard/summary/", DashboardSummaryView.as_view(), name="dashboard-summary"),
     path("dashboard/timeseries/", DashboardTimeseriesView.as_view(), name="dashboard-timeseries"),
