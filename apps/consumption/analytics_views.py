@@ -14,6 +14,7 @@ from .dashboard_db import dashboard_connection
 
 
 DATE_PARAMS = ("period1_from", "period1_to", "period2_from", "period2_to")
+ALTERNATIVES = {"two_sided", "greater", "less"}
 
 
 def _parse_date_param(request, name: str) -> date:
@@ -38,6 +39,13 @@ def _parse_alpha(request) -> float:
     return alpha
 
 
+def _parse_alternative(request) -> str:
+    value = request.query_params.get("alternative", "two_sided")
+    if value not in ALTERNATIVES:
+        raise ValidationError({"detail": "Параметр alternative должен быть одним из: two_sided, greater, less"})
+    return value
+
+
 def _validate_periods(period1_from: date, period1_to: date, period2_from: date, period2_to: date) -> None:
     if period1_from > period1_to:
         raise ValidationError({"detail": "В первом периоде дата начала позже даты конца"})
@@ -58,6 +66,7 @@ class PeriodComparisonView(APIView):
         period2_from = _parse_date_param(request, "period2_from")
         period2_to = _parse_date_param(request, "period2_to")
         alpha = _parse_alpha(request)
+        alternative = _parse_alternative(request)
         _validate_periods(period1_from, period1_to, period2_from, period2_to)
 
         with dashboard_connection(dashboard_queries._metadata_db_alias()) as connection:
@@ -76,6 +85,7 @@ class PeriodComparisonView(APIView):
                 "date_to": period2_to.isoformat(),
             },
             "alpha": alpha,
+            "alternative": alternative,
             "data_names": data_names,
             "metric": "active_power_w_avg",
         }

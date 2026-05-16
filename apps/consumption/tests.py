@@ -64,6 +64,22 @@ class PeriodComparisonViewTests(SimpleTestCase):
 
         self.assertEqual(response.status_code, 400)
 
+    def test_invalid_alternative_returns_400(self):
+        self.authenticate()
+
+        response = self.client.get(
+            self.endpoint,
+            {
+                "period1_from": "2021-01-01",
+                "period1_to": "2021-01-02",
+                "period2_from": "2021-01-03",
+                "period2_to": "2021-01-04",
+                "alternative": "bad_value",
+            },
+        )
+
+        self.assertEqual(response.status_code, 400)
+
     @patch("apps.consumption.analytics_views.request_period_comparison")
     @patch("apps.consumption.analytics_views.dashboard_queries._matching_data_names")
     @patch("apps.consumption.analytics_views.dashboard_connection")
@@ -73,7 +89,9 @@ class PeriodComparisonViewTests(SimpleTestCase):
         matching_data_names.return_value = ["meter-1", "meter-2"]
         request_period_comparison.return_value = {
             "hypothesis": "H0",
-            "alternative": "two_sided",
+            "alternative": "greater",
+            "alternative_hypothesis": "H1",
+            "decision_rule": "z_statistic > z_critical",
             "alpha": 0.05,
             "metric": "active_power_w_avg",
             "unit": "kW",
@@ -95,6 +113,7 @@ class PeriodComparisonViewTests(SimpleTestCase):
                 "period2_from": "2021-01-03",
                 "period2_to": "2021-01-04",
                 "alpha": "0.05",
+                "alternative": "greater",
             },
         )
 
@@ -104,6 +123,7 @@ class PeriodComparisonViewTests(SimpleTestCase):
                 "period_1": {"date_from": "2021-01-01", "date_to": "2021-01-02"},
                 "period_2": {"date_from": "2021-01-03", "date_to": "2021-01-04"},
                 "alpha": 0.05,
+                "alternative": "greater",
                 "data_names": ["meter-1", "meter-2"],
                 "metric": "active_power_w_avg",
             }
