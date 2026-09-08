@@ -272,6 +272,8 @@ def _metadata_ctes() -> str:
                    COALESCE(NULLIF(cl.room_description, ''), NULLIF(cl.org_structure, ''), cl.room) AS power_consumer,
                    cl.org_structure AS consumer_class,
                    cl.room,
+                   cl.floor,
+                   cl.building,
                    NULL::text AS phase1_color,
                    NULL::text AS phase2_color,
                    NULL::text AS phase3_color,
@@ -812,7 +814,8 @@ def get_device_detail(request, data_name):
             connection.execute(
                 f"""
                 {_with_metadata(include_power_readings=False)}
-                SELECT power_consumer, consumer_class, room, phase1_color, phase2_color, phase3_color
+                SELECT power_consumer, consumer_class, room, floor, building,
+                       phase1_color, phase2_color, phase3_color
                 FROM consumers
                 WHERE data_name = %s
                 ORDER BY consumer_class, room, power_consumer
